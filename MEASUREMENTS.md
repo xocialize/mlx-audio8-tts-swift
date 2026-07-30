@@ -124,6 +124,61 @@ Iris sits at digital full scale on every prompt (2 of 18 runs cross the −0.5 d
 threshold outright). This is inherited from the corpus clip, not introduced by the port — but any
 consumer normalizing or concatenating these voices needs headroom management.
 
+## 2026-07-30 (third pass) — the activation MODEL, and long-form orchestration
+
+Two more measured points (a 48 s one-shot at 1035 frames, and a 7-segment orchestrated render of
+the same passage) turned the activation envelope from a list of samples into a fitted model.
+
+### The transient is linear in generated frames
+
+Five points spanning 50× (20 → 1035 frames), least-squares:
+
+    transient_MB ≈ 1824 + 14.2 × frames          (one frame ≈ 46 ms of audio)
+
+| frames | audio | predicted | measured |
+|---|---|---|---|
+| 337 | 15.6 s | 6.45 GB | **6.20 GB** |
+| 512 | 23.8 s | 8.87 GB | — (the package's default `maxFrames` cap) |
+| 1035 | 48.0 s | 16.12 GB | **16.19 GB** |
+| 2048 | 95.0 s | 30.14 GB | — (the `maxFrames` ceiling) |
+
+Within 4% across the range. The large constant (~1.8 GB) is why short utterances are so
+inefficient on both axes — memory and RTF.
+
+**This is what set the final declaration.** `peakActivationBytes` must cover the longest run the
+package permits *by default* — 512 frames ⇒ 8.87 GB ⇒ declared **9.50 GB**. The two earlier
+values (5.00, then 7.20) were both under for the same reason: the sample never reached the cap.
+A caller raising `maxFrames` is opting out of the declared envelope, which is inherent to
+whole-utterance decoding rather than a defect.
+
+### Long-form: chunked vs one-shot (48 s passage, same voice)
+
+| | orchestrated (7 segments) | one-shot |
+|---|---|---|
+| audio | 48.1 s | 47.7 s |
+| RTF | **1.16** | 1.33 |
+| peak transient | **5.97 GB** | **16.19 GB** |
+
+Chunking via `TTSOrchestratorKit` cut peak activation by 10.2 GB (63%) **and ran faster** — the
+expectation that chunking would trade throughput for memory is wrong here, because the giant
+single decode is memory-bound. Chunking also *bounds* the peak: the one-shot figure grows without
+limit in passage length, the chunked one does not.
+
+Note the orchestrated RTF (1.16) is still above the single-utterance median (0.94): seven requests
+carry seven lots of fixed cost, and the anchored-reference mode adds one extra reference encode.
+The fixed cost is the same ~1.8 GB / ~1 s constant that makes short utterances inefficient.
+
+### Streaming: the in-package fix (not yet built)
+
+The codec decoder is **strictly causal** — left-padded convs, right-trimmed transpose convs, and a
+causal windowed attention mask — which is the precondition `mlx-gepard-swift` relies on for its
+exact windowed decode (`NanoCodec.leftReceptiveFieldFrames`, decode `[a−L, b)` and discard the
+first `L` frames' samples, bit-identical for `L ≥` the stack's left receptive field). The same
+argument applies here, with one caveat: Audio8's `post_module` is a windowed transformer with
+`window_size = 128` **frames**, so `L ≥ 128` (~5.9 s) versus NanoCodec's ~26. Still a constant,
+so it still bounds the transient — just a larger one. Implementing it would cap activation
+regardless of utterance length and unlock `StreamEmitting`.
+
 ### Not yet measured
 
 - Quantized (int8/int4) LM tier — no quantized variant published yet.
