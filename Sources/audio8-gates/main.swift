@@ -567,6 +567,56 @@ func gateStream() async throws {
     finish("STREAM")
 }
 
+
+// MARK: - STREAMENV: does streaming actually BOUND activation, or merely reduce it?
+
+/// The batch transient is linear in frames (1824 + 14.2·frames MB). Streaming should be FLAT —
+/// bounded by chunk+context, not by utterance length. That is the difference between "uses less
+/// memory" and "has a declarable envelope", so it is measured across the length range rather
+/// than asserted from one run.
+func gateStreamEnvelope() async throws {
+    let goldens = loadGoldens()
+    let refText = "You know, I was thinking about what you said earlier, and honestly, I think you might be right about the whole thing."
+    let refSamples: [Float] = goldens["ref_audio_44100"]!.asArray(Float.self)
+    let refURL = FileManager.default.temporaryDirectory.appendingPathComponent("audio8-env-ref.wav")
+    try writeWav(refSamples, to: refURL)
+    let refAudio = Audio(format: .wav, data: try Data(contentsOf: refURL),
+                         sampleRate: 44100, channels: 1)
+
+    let package = Audio8Package(configuration: Audio8Configuration(modelDirectory: modelDir))
+    try await package.load()
+    MLX.GPU.clearCache()
+    let floor = MLX.Memory.activeMemory
+    print(String(format: "  resident floor %.0f MB", Double(floor) / 1_048_576))
+    print("  frames   batch peak      stream peak")
+
+    // maxFrames drives utterance length; greedy keeps it deterministic across the two paths.
+    for cap in [64, 128, 256, 512] {
+        func request() -> TTSRequest {
+            TTSRequest(text: "This passage exists to be generated at a controlled length so the "
+                       + "activation envelope can be measured against the number of frames the "
+                       + "model actually produces, rather than against a single sample.",
+                       voice: VoiceSelector(.referenceAudio(refAudio)),
+                       referenceTranscript: refText,
+                       metaData: ["seed": .int(5), "greedy": .bool(true), "maxFrames": .int(cap)])
+        }
+        MLX.GPU.clearCache(); GPU.resetPeakMemory()
+        _ = try await package.run(request())
+        let batchPeak = MLX.Memory.peakMemory - floor
+
+        MLX.GPU.clearCache(); GPU.resetPeakMemory()
+        var frames = 0
+        _ = try await package.runStream(request()) { chunk in
+            frames += chunk.samples.count / ArkttsCodec.frameLength
+        }
+        let streamPeak = MLX.Memory.peakMemory - floor
+        print(String(format: "  %5d    %7.0f MB      %7.0f MB",
+                     frames, Double(batchPeak) / 1_048_576, Double(streamPeak) / 1_048_576))
+    }
+    await package.unload()
+    finish("STREAMENV")
+}
+
 // MARK: - CAN live: the MID-RUN checkpoint (the offline gate only proves the entry one)
 
 /// The offline `CancellationConformance.checkRun` cancels BEFORE `run()` starts, so it exercises
@@ -633,7 +683,7 @@ case "--s0": try gateS0()
 case "--s5": try gateS5()
 case "--s1": try gateS1()
 case "--s2": try gateS2()
-case "--s2b", "--validate", "--cancel", "--stream":
+case "--s2b", "--validate", "--cancel", "--stream", "--streamenv":
     let semaphore = DispatchSemaphore(value: 0)
     Task {
         do {
@@ -641,6 +691,7 @@ case "--s2b", "--validate", "--cancel", "--stream":
             case "--s2b": try await gateS2b()
             case "--cancel": try await gateCancel()
             case "--stream": try await gateStream()
+            case "--streamenv": try await gateStreamEnvelope()
             default: try await gateValidate()
             }
         } catch {

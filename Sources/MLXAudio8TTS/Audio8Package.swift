@@ -30,32 +30,26 @@ import MLXToolKit
 public final class Audio8Package: ModelPackage, StreamEmitting {
     public typealias Configuration = Audio8Configuration
 
-    /// Split footprints — MEASURED, and revised twice. MEASUREMENTS.md carries every pass.
+    /// Split footprints — MEASURED. MEASUREMENTS.md carries every pass.
     ///   • resident floor (MLX-active, post-load, pre-run): 2434 MB → declared 2.60 GB.
-    ///   • activation: the transient is LINEAR in generated frames, fitted across a 50× range
-    ///     (20 → 1035 frames, five measured points, ±4%):
+    ///   • activation: **FLAT at 3482 MB**, independent of utterance length → declared 4.20 GB.
     ///
-    ///         transient_MB ≈ 1824 + 14.2 × frames        (one frame ≈ 46 ms of audio)
+    /// The activation envelope stopped being a function of the input in v0.2.0, when the
+    /// windowed decode landed and `generate` was routed through it. Before that the transient
+    /// was linear in frames (`≈ 1824 + 14.2 × frames` MB) and every declaration under-shot it,
+    /// three times running, because a sample never reaches the cap:
     ///
-    /// The declaration must therefore cover the longest run this package PERMITS BY DEFAULT,
-    /// which is `maxFrames` = 512 ⇒ ≈ 8.87 GB. Declared 9.50 GB.
+    ///     v0.1.0  5.00 GB   from one 9.2 s utterance
+    ///     v0.1.1  7.20 GB   from a corpus sweep topping out at 15.7 s
+    ///     v0.1.2  9.50 GB   from the fitted model at the default maxFrames cap
+    ///     v0.2.1  4.20 GB   MEASURED FLAT — the length dependence is gone
     ///
-    /// Two earlier values were both wrong, for the same reason each time — the sample did not
-    /// span the envelope. 5.00 GB came from one 9.2 s utterance; 7.20 GB came from a corpus
-    /// sweep whose longest utterance was 15.7 s. Neither reached the default cap. `MemoryGovernor`
-    /// reserves exactly this number, so under-declaring mis-sizes admissibility for every
-    /// co-resident model while this package overruns what was budgeted for it.
-    ///
-    /// **A caller that raises `maxFrames` opts OUT of this envelope** — at the 2048 ceiling the
-    /// transient is ≈ 30 GB. That is inherent to whole-utterance decoding, not a bug: the codec
-    /// decodes an entire utterance through its conv stack in one pass. The supported way to
-    /// synthesize long text is to sentence-chunk it (TTSOrchestratorKit), which caps every decode
-    /// at the chunk target. Measured on a 48 s passage: chunked 5.97 GB peak vs one-shot 16.19 GB,
-    /// and the chunked path was also FASTER (RTF 1.16 vs 1.33) because the giant decode is
-    /// memory-bound. A windowed causal decode (the mlx-gepard-swift pattern — this codec is
-    /// strictly causal, so the same exactness argument holds) would bound it in-package.
+    /// Verified across 64 → 224 frames in one sweep and against a 1035-frame run: 3482 MB every
+    /// time. That is worth more than the 5.3 GB reduction itself — a declaration the governor
+    /// reserves is only meaningful if the real envelope cannot exceed it, and this one now
+    /// cannot. `maxFrames` no longer changes the memory story, only the duration.
     nonisolated static let bf16ResidentBytes: UInt64 = 2_600_000_000
-    nonisolated static let peakActivationBytes: UInt64 = 9_500_000_000
+    nonisolated static let peakActivationBytes: UInt64 = 4_200_000_000
 
     public nonisolated static var manifest: PackageManifest {
         PackageManifest(

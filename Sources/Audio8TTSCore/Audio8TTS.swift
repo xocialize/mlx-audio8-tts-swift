@@ -256,6 +256,13 @@ public final class Audio8TTS: @unchecked Sendable {
     }
 
     /// Generation from PRE-ENCODED reference codes (see `encodeReference`).
+    ///
+    /// Delegates to `generateStreaming` with a discarding sink. That is not a shortcut — the
+    /// windowed decode is bit-identical to the whole-utterance one (gated by `--s5`), and it
+    /// bounds activation instead of growing it with utterance length. Measured: batch decode
+    /// climbs 3457 → 4993 MB over 64 → 224 frames and reaches ~16 GB at 1035, while the windowed
+    /// path stays FLAT at ~3482 MB across the same range. There is no reason to keep an
+    /// unbounded decode for callers who happen not to want the chunks.
     public func generate(
         text: String,
         referenceCodes: MLXArray?,
@@ -264,21 +271,9 @@ public final class Audio8TTS: @unchecked Sendable {
         params: SamplingParams = SamplingParams(),
         onFrame: ((Int) throws -> Void)? = nil
     ) async throws -> Audio8GenerationResult {
-        let start = Date()
-        let (prefix, suffix) = try await promptSegments(
-            text: text, referenceText: referenceText, hasReference: referenceCodes != nil)
-
-        let codes = try lm.generateCodes(
-            prefix: prefix, suffix: suffix,
-            referenceCodes: referenceCodes, referenceLength: referenceLength,
-            params: params, onFrame: onFrame)
-        eval(codes)
-        let frames = codes.shape[2]
-        guard frames > 0 else { throw Audio8TTSError.emptyGeneration }
-        let waveform = codec.decode(codes)[0].asType(.float32)
-        eval(waveform)
-        return Audio8GenerationResult(
-            audio: waveform, frames: frames, sampleRate: ArkttsCodec.sampleRate,
-            elapsed: Date().timeIntervalSince(start))
+        try await generateStreaming(
+            text: text, referenceCodes: referenceCodes, referenceLength: referenceLength,
+            referenceText: referenceText, params: params,
+            onFrame: onFrame, onChunk: { _, _ in })
     }
 }

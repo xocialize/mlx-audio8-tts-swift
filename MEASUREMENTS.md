@@ -242,6 +242,26 @@ The first implementation completed the whole AR rollout before decoding, giving 
 causal, so running it over a prefix yields identical values for that prefix — brought it to
 **2.41 s**. The memory bound is the durable win: it no longer grows with utterance length.
 
+## 2026-07-30 (fifth pass) — the envelope became FLAT
+
+Routing `generate` through the windowed decode removed the length dependence entirely, which
+changes the footprint from a fitted line into a constant.
+
+| generated frames | batch peak (before) | batch peak (after) | streaming peak |
+|---|---|---|---|
+| 64 | 3457 MB | **3482 MB** | 3482 MB |
+| 128 | 4969 MB | **3482 MB** | 3482 MB |
+| 224 | 4993 MB | **3482 MB** | 3482 MB |
+| 1035 | ~16 190 MB | — | 3482 MB |
+
+`peakActivationBytes` **9.50 → 4.20 GB**, and the reduction is the smaller half of the point:
+the governor reserves this number, and it is now one the real envelope *cannot* exceed. Before,
+every value was a bet on how long an utterance a caller would ask for — a bet lost three times
+(5.00 → 7.20 → 9.50 GB), each time for the same reason.
+
+`maxFrames` no longer affects memory at all, only duration. `--s5` still passes, so the audio is
+unchanged: this is the same computation, windowed.
+
 ### Not yet measured
 
 - Quantized (int8/int4) LM tier — no quantized variant published yet.
