@@ -64,6 +64,66 @@ This probe lets a 600-frame generation get underway, cancels at t=1.500 s, and m
 That 30 ms is the evidence the **per-frame** checkpoint fires; an uncancelled run of the same
 request takes >20 s. Without this, "CAN-1..3 green" would only mean the entry checkpoint works.
 
+## 2026-07-30 (second pass) — 18-run corpus sweep through the ENGINE
+
+Run from the Audio8 Demo app (Release, sandboxed, engine-owned lifecycle) rather than the CLI
+gate: 6 corpus voices × 3 prompt lengths, deterministic decoding. This is the pass that
+established the real activation envelope — **and corrected a 27% under-declaration** the
+single-utterance first pass had produced.
+
+### Throughput
+
+| | median | best | worst |
+|---|---|---|---|
+| RTF | **0.94** | 0.85 | 1.64 |
+
+Mean 21.8 frames/s. The median matches the CLI gate's 0.96, so the engine/sandbox path costs
+essentially nothing — an earlier apparent ~15% gap was **warm-up plus a single short sample**,
+not overhead. The first run after a load measured RTF 1.80 against a steady-state 1.11 on the
+same input; never quote a first run.
+
+**RTF is length-dependent, and short utterances are slower than realtime:**
+
+| prompt | audio | RTF range |
+|---|---|---|
+| Short | ~0.9 s | 1.05 – 1.64 |
+| Medium | ~5.2 s | 0.86 – 0.94 |
+| Long | 12.4 – 15.7 s | 0.85 – 0.94 |
+
+Fixed per-request cost (reference encode + prefill) dominates a one-second utterance. The model
+is faster than realtime only above roughly 5 s of output — worth knowing before promising
+realtime behavior on short conversational turns.
+
+### Activation envelope (the correction)
+
+| audio | transient |
+|---|---|
+| 0.9 s | ~1.6 GB |
+| 5.2 s | ~4.4 GB |
+| 13.2 – 15.7 s | 5.4 – **6.35 GB** |
+
+The first pass declared 5.00 GB from one 9.2 s utterance measuring 4413 MB. The sweep's longest
+utterance (15.65 s, Mia/Long) measures **6352 MB** — 27% over the declaration. `MemoryGovernor`
+reserves exactly `peakActivationBytes`, so the under-declaration silently mis-sized every
+co-resident admissibility decision. Declaration raised to **7.20 GB**.
+
+Generalizable: when activation scales with an input dimension, one sample does not establish the
+envelope — sweep the range and declare the max.
+
+### Output level (a finding, not a defect in the port)
+
+Cloned output tracks the REFERENCE clip's level, so a hot reference yields a hot render:
+
+| voice | rms | peak |
+|---|---|---|
+| iris | −10.9 … −13.4 dBFS | **−0.3 … −0.7 dBFS** |
+| mia | −15.4 … −20.7 | −0.7 … −8.0 |
+| clara | −26.2 … −28.7 | −11.8 … −15.2 |
+
+Iris sits at digital full scale on every prompt (2 of 18 runs cross the −0.5 dBFS clipping
+threshold outright). This is inherited from the corpus clip, not introduced by the port — but any
+consumer normalizing or concatenating these voices needs headroom management.
+
 ### Not yet measured
 
 - Quantized (int8/int4) LM tier — no quantized variant published yet.

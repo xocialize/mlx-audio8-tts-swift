@@ -30,19 +30,22 @@ import MLXToolKit
 public final class Audio8Package: ModelPackage {
     public typealias Configuration = Audio8Configuration
 
-    /// Split footprints — MEASURED via `audio8-gates --validate` (2026-07-30, M-series;
-    /// MEASUREMENTS.md carries the full run). bf16 LM + fp32 codec.
-    ///   • resident floor (MLX-active, post-load, pre-run): **2434 MB** → declared 2.60 GB.
-    ///   • transient (MLX high-water − resident) on a 9.2 s utterance: **4413 MB** → declared
-    ///     5.00 GB. Scales with utterance length — the same 9.2 s run measured 4413 MB while a
-    ///     short line measured 1623 MB — because the codec decodes the WHOLE utterance through
-    ///     its deep conv stack in one pass (the shape Gepard's pre-streaming V1 also had).
-    ///     Declared for a long single utterance; operationally a caller sentence-chunks, and the
-    ///     reactive R-MEM-1 trigger covers any overflow past the declared peak.
-    /// `unload()` returns MLX active AND cache to 0 MB (verified in the same run), so eviction
-    /// really does reclaim; residual process phys after unload is allocator page retention.
+    /// Split footprints — MEASURED. Revised 2026-07-30 after an 18-run corpus sweep through
+    /// the real engine (Audio8 Demo, Release, M-series); MEASUREMENTS.md carries both passes.
+    ///   • resident floor (MLX-active, post-load, pre-run): 2434 MB → declared 2.60 GB.
+    ///   • transient (MLX high-water − floor): **6352 MB** on the worst run → declared 7.20 GB.
+    ///
+    /// The transient scales with utterance length, and the FIRST declaration here (5.00 GB) was
+    /// set from a single 9.2 s utterance that measured 4413 MB. That under-declared the real
+    /// envelope by 27%: a 15.7 s utterance measures 6352 MB. Under-declaring is not a cosmetic
+    /// error — `MemoryGovernor` reserves exactly `peakActivationBytes`, so every other model's
+    /// admissibility is computed against a transient this package then overruns.
+    ///
+    /// The lesson generalizes: for a package whose activation scales with an input dimension,
+    /// one sample does not establish the envelope. Sweep the length range and declare the max.
+    /// Measured points: 0.9 s → ~1.6 GB · 5.2 s → ~4.4 GB · 13–15.7 s → 5.4–6.35 GB.
     nonisolated static let bf16ResidentBytes: UInt64 = 2_600_000_000
-    nonisolated static let peakActivationBytes: UInt64 = 5_000_000_000
+    nonisolated static let peakActivationBytes: UInt64 = 7_200_000_000
 
     public nonisolated static var manifest: PackageManifest {
         PackageManifest(
