@@ -9,6 +9,7 @@
 import Foundation
 import MLXToolKit
 import MLXServeConformance
+import MLXServeCore
 import XCTest
 
 @testable import MLXAudio8TTS
@@ -53,16 +54,23 @@ final class ManifestConformanceTests: XCTestCase {
         }
     }
 
-    /// The manifest must not claim streaming: this package decodes the whole utterance in one
-    /// pass and does not conform to `StreamEmitting`. A `.audioChunk` declaration here would be
-    /// a false capability claim to the orchestrator.
-    func testDoesNotClaimStreaming() {
-        XCTAssertFalse(Audio8Package.manifest.specialties.contains { $0.specialty == .realtimeStreaming },
-                       "Audio8 synthesizes whole utterances — do not claim realtimeStreaming")
-        for surface in Audio8Package.manifest.surfaces {
-            XCTAssertNil(surface.streaming,
-                         "surface \(surface.name) declares streaming but the package is not StreamEmitting")
-        }
+    /// Streaming is now CLAIMED, and the claim has to stay backed. This test used to assert
+    /// the opposite — that the package must NOT advertise streaming — which was correct while
+    /// the codec decoded whole utterances in one pass. It is kept (inverted) rather than
+    /// deleted, because the failure it guards against is the same in both directions: a
+    /// manifest that advertises a capability the code does not have.
+    ///
+    /// What backs the claim: the decoder stack below `post_module` is strictly causal, and the
+    /// `--s5` gate proves the windowed decode is bit-identical (max_abs exactly 0) to the
+    /// whole-utterance decode at or above the measured chunk floor.
+    func testStreamingClaimIsBacked() {
+        let advertises = Audio8Package.manifest.surfaces.contains { $0.streaming != nil }
+        let claimsSpecialty = Audio8Package.manifest.specialties
+            .contains { $0.specialty == .realtimeStreaming }
+        let conforms = Audio8Package.self is any StreamEmitting.Type
+        XCTAssertTrue(conforms, "package must conform to StreamEmitting")
+        XCTAssertTrue(advertises, "surface must advertise a streaming granularity")
+        XCTAssertTrue(claimsSpecialty, ".realtimeStreaming must be declared")
     }
 
     /// C1 — the package serves the `tts` capability and nothing it cannot do.
@@ -153,5 +161,36 @@ final class CancellationConformanceTests: XCTestCase {
                 .init(phase: .generate, unit: .frame, reportsRunProgress: true),
             ]))
         XCTAssertTrue(report.passed, report.summary)
+    }
+}
+
+final class StreamingConformanceTests: XCTestCase {
+
+    /// STR-1 — the surface advertises streaming AND the type actually conforms. These drift
+    /// apart easily: a manifest edit is cheap, a working `runStream` is not, and a surface that
+    /// advertises `.audioChunk` without the conformance is a promise the orchestrator will act
+    /// on. (This package deliberately did NOT advertise streaming until the windowed decode
+    /// existed — see the `--s5` bit-identity gate.)
+    func testStreamingAdvertisementIsCoherent() {
+        let report = StreamingConformance.checkAdvertisement(Audio8Package.self)
+        XCTAssertTrue(report.passed, report.summary)
+    }
+
+    /// STR-2 — a pre-cancelled stream surfaces CancellationError before emitting anything.
+    func testPreCancelledStreamPropagates() async {
+        let package = Audio8Package(configuration: Audio8Configuration())
+        let report = await StreamingConformance.checkPreCancelledStream(
+            package: package,
+            request: TTSRequest(text: "streaming cancellation probe"))
+        XCTAssertTrue(report.passed, report.summary)
+    }
+
+    /// The manifest may only claim `.realtimeStreaming` while the package can actually stream.
+    func testRealtimeStreamingClaimIsBacked() {
+        let claims = Audio8Package.manifest.specialties.contains { $0.specialty == .realtimeStreaming }
+        let conforms = Audio8Package.self is any StreamEmitting.Type
+        XCTAssertEqual(claims, conforms,
+                       "the .realtimeStreaming specialty and StreamEmitting conformance must "
+                       + "agree — one without the other misleads capability routing")
     }
 }

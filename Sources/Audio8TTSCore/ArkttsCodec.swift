@@ -316,13 +316,140 @@ public final class ArkttsCodec: @unchecked Sendable {
 
     /// codes (B, 10, T) → latent (B, T*4, 1024)
     public func quantizerDecode(_ codes: MLXArray) -> MLXArray {
+        upsample(postModuleLatent(codes))
+    }
+
+    // MARK: - The streaming split
+    //
+    // The decode path has two halves with VERY different characters, and separating them is
+    // what makes a bounded decode possible here:
+    //
+    //   codes ─▶ RVQ + post_module ─▶ latent ─▶ upsample + decoder ─▶ waveform
+    //            └─ long context,              └─ short context (11 frames),
+    //               cheap (1024 × T)              expensive (expands to 2048 × T samples)
+    //
+    // `post_module` is 8 stacked layers of 128-wide causal attention, so its receptive field
+    // COMPOUNDS to 8 × 127 = 1016 frames (~47 s). Windowing the whole stack the way
+    // mlx-gepard-swift windows NanoCodec (L ≈ 26) is therefore not viable — the context would
+    // exceed a typical utterance. But it is also not where the memory goes: it is a transformer
+    // over 1024 × T, while the conv stack below it expands to 2048 samples PER FRAME through
+    // 1536/768/384/192/96-channel intermediates. That half has a receptive field of 11 frames.
+    //
+    // So: run `post_module` once over the whole utterance, then window only the conv stack.
+    // Same exactness argument as Gepard's, applied at the seam where it actually holds.
+
+    /// codes → `post_module` output (B, T, 1024). The long-context, cheap half.
+    public func postModuleLatent(_ codes: MLXArray) -> MLXArray {
         let semanticIndices = clip(codes[0..., ..<1], min: 0, max: 4095)
         let residualIndices = clip(codes[0..., 1...], min: 0, max: 1023)
         let semantic = residualFromCodes(semanticIndices, prefix: "quantizer.semantic_quantizer")
         let residual = residualFromCodes(residualIndices, prefix: "quantizer.quantizer")
-        let post = windowTransformer(
+        return windowTransformer(
             semantic + residual, prefix: "quantizer.post_module", spec: postSpec)
-        return upsample(post)
+    }
+
+    /// `post_module` latent (B, T, 1024) → waveform (B, T*2048). The short-context, expensive half.
+    public func decodeFromLatent(_ latent: MLXArray) -> MLXArray {
+        decoderForward(upsample(latent))
+    }
+
+    /// Left receptive field of `decodeFromLatent`, in LATENT FRAMES, computed from the actual
+    /// loaded kernel shapes rather than hardcoded.
+    ///
+    /// Every op below `post_module` is strictly causal — convs left-pad only (stride-1 causal
+    /// convs add no right padding), transpose convs trim right only, and the activations are
+    /// pointwise. So decoding frames `[a-L, b)` and discarding the first `L` frames' samples is
+    /// **bit-identical** to decoding `[0, b)` and slicing, for any `L >= leftReceptiveFieldFrames`.
+    /// That exactness is the whole point: this is a windowing of the same computation, not an
+    /// approximation of it.
+    ///
+    /// Backward extent propagation, output → input. Per decoder block (walked in reverse): the
+    /// three residual units contribute `Σ (k-1)·dilation`, then the transposed up-conv converts
+    /// fine → coarse as `ceil((e + k - 1) / stride)`.
+    public var leftReceptiveFieldFrames: Int {
+        func kernel(_ key: String) -> Int { weights[key].map { $0.shape[1] } ?? 1 }
+
+        // Residual units: causalConv k dilation d, then k=1 → (k-1)·d each.
+        let resKernel = kernel("decoder.model.1.block.2.block.1.conv.weight")
+        let resExtent = [1, 3, 9].reduce(0) { $0 + (resKernel - 1) * $1 }
+
+        var extent = kernel("decoder.model.6.conv.weight") - 1     // final causal conv
+        for (index, stride) in [8, 8, 4, 2].enumerated().reversed() {
+            extent += resExtent
+            let k = kernel("decoder.model.\(index + 1).block.1.conv.weight")
+            extent = Int((Double(extent + k - 1) / Double(stride)).rounded(.up))
+        }
+        extent += kernel("decoder.model.0.conv.weight") - 1        // decoder input conv
+        // Now in latent positions (4×frames). Walk back through the two upsample stages.
+        for stage in [1, 0] {
+            extent += kernel("quantizer.upsample.\(stage).1.dwconv.conv.weight") - 1
+            let k = kernel("quantizer.upsample.\(stage).0.conv.weight")
+            extent = Int((Double(extent + k - 1) / Double(2)).rounded(.up))
+        }
+        return extent
+    }
+
+    /// The smallest chunk size at which windowed decode is **bit-identical** to the
+    /// whole-utterance decode, measured (`--s5`), not derived.
+    ///
+    /// The windowing is algorithmically exact at `leftReceptiveFieldFrames` of context — the
+    /// context sweep proves that, since raising context from 11 to 128 frames changes the
+    /// result not at all. What does change it is the SIZE of the decoded window: MLX selects
+    /// different conv kernels for small inputs, and their fp32 reduction order differs from the
+    /// path a full-length decode takes. Measured on a 102-frame utterance:
+    ///
+    ///     chunk  8 → 1.4e-3      chunk 48 → 0.0
+    ///     chunk 16 → 1.4e-3      chunk 64 → 0.0
+    ///     chunk 32 → 2.5e-4      chunk 96 → 0.0
+    ///
+    /// So the rule is a floor on chunk size, not on context. 1.4e-3 on a [-1,1] waveform is
+    /// about −57 dBFS and inaudible, but "bit-identical" is a claim worth keeping true rather
+    /// than approximately true — hence the default sits above the threshold.
+    public var minimumExactChunkFrames: Int { 48 }
+
+    /// Windowed, incremental decode. Emits each chunk's samples through `onChunk` as soon as it
+    /// is decoded, and never holds more than `context + chunkFrames` frames in the conv stack —
+    /// so peak activation is bounded by the chunk size instead of growing with utterance length.
+    ///
+    /// - Parameters:
+    ///   - codes: (B, 10, T). Batch 1.
+    ///   - chunkFrames: frames emitted per chunk. **Keep this ≥ `minimumExactChunkFrames`**
+    ///     (48) — see that property for why smaller chunks stop being bit-exact.
+    ///   - contextFrames: left context. Defaults to `leftReceptiveFieldFrames`, the smallest
+    ///     value that is structurally sufficient. Lower it only to demonstrate the drift.
+    ///   - onChunk: `(samples, isFinal)`, called in order.
+    public func decodeStreaming(_ codes: MLXArray,
+                                chunkFrames: Int = 64,
+                                contextFrames: Int? = nil,
+                                onChunk: (MLXArray, Bool) throws -> Void) rethrows {
+        let latent = postModuleLatent(codes.asType(.int32))
+        eval(latent)
+        let total = latent.shape[1]
+        guard total > 0 else { return }
+        let context = max(0, contextFrames ?? leftReceptiveFieldFrames)
+        let step = max(1, chunkFrames)
+
+        // Never emit a degenerate final chunk: if the remainder after this one would be
+        // smaller than `minTail`, absorb it here instead. Two reasons — a tiny decode is pure
+        // overhead (it still pays the full `context` re-decode), and MLX selects different conv
+        // kernels for very small inputs, so a stub window is where windowed output stops being
+        // bit-reproducible against the whole-utterance decode on the GPU stream.
+        let minTail = max(8, step / 4)
+        var start = 0
+        while start < total {
+            var end = min(start + step, total)
+            if total - end < minTail { end = total }
+            let windowStart = max(0, start - context)
+            let window = latent[0..., windowStart ..< end]
+            let decoded = decodeFromLatent(window)
+            // Drop the contaminated prefix: those positions were computed against zero-padding
+            // where the full decode had real context.
+            let drop = (start - windowStart) * Self.frameLength
+            let samples = decoded[0..., drop...]
+            eval(samples)
+            try onChunk(samples, end >= total)
+            start = end
+        }
     }
 
     // MARK: public surface

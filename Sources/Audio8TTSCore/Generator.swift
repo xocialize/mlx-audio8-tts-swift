@@ -161,7 +161,8 @@ extension ArkttsModel {
         prefix: [Int32], suffix: [Int32],
         referenceCodes: MLXArray? = nil, referenceLength: Int = 0,
         params: SamplingParams = SamplingParams(),
-        onFrame: ((Int) throws -> Void)? = nil
+        onFrame: ((Int) throws -> Void)? = nil,
+        onFrameCodes: ((MLXArray) throws -> Void)? = nil
     ) throws -> MLXArray {
         let (prompt, promptMask) = preparePrompt(
             prefix: prefix, suffix: suffix,
@@ -200,6 +201,10 @@ extension ArkttsModel {
                 previous = concatenated([previous![0..., 1...], semantic[0..., .newAxis]], axis: 1)
             }
             try onFrame?(frames.count)
+            // Hand the just-emitted frame out so a streaming caller can decode ahead of the
+            // rollout finishing — without this the decode can only start once every frame
+            // exists, which is most of the wall clock.
+            try onFrameCodes?(codebooks)
 
             let nextColumn = concatenated([semantic[0..., .newAxis], codebooks], axis: 1)[.ellipsis, .newAxis]
             mask = concatenated([mask, MLXArray.ones([1, 1], dtype: .int32)], axis: 1)

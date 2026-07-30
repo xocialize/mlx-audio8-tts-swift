@@ -179,6 +179,69 @@ argument applies here, with one caveat: Audio8's `post_module` is a windowed tra
 so it still bounds the transient — just a larger one. Implementing it would cap activation
 regardless of utterance length and unlock `StreamEmitting`.
 
+## 2026-07-30 (fourth pass) — windowed streaming decode
+
+Built the in-package fix the third pass identified. The naive placement — window the whole
+decode, as `mlx-gepard-swift` does for NanoCodec — **does not work here**, and finding out why
+determined the design.
+
+### Why the obvious placement fails, and where the seam actually is
+
+`post_module` is 8 stacked layers of 128-wide causal attention, so its receptive field
+**compounds**: 8 × 127 = **1016 frames (47 s)**. Windowing above it would need more left context
+than a typical utterance contains. But it is also not where the memory goes — it is a transformer
+over 1024 × T, while the conv stack below expands to 2048 samples per frame through
+1536/768/384/192/96-channel intermediates.
+
+So the stack is split at `post_module`'s output:
+
+    codes ─▶ RVQ + post_module ─▶ latent ─▶ upsample + decoder ─▶ waveform
+             └─ long context (1016), cheap   └─ short context (11), expensive
+
+Derived left receptive field of the windowed half: **11 frames**, by backward extent propagation
+(residual units `Σ(k−1)·d = 78` per block, transpose convs `ceil((e+k−1)/stride)`).
+
+### Bit-identity (`--s5`)
+
+| context | max_abs vs whole-utterance decode |
+|---|---|
+| 0 | 1.8e-1 |
+| 4 | 8.9e-3 |
+| 8 | 2.1e-5 |
+| **10** | **0.0** |
+| 11 (derived) | 0.0 |
+| 32 | 0.0 |
+
+Measured minimum is 10; the derivation says 11 — **sufficient with 1 frame of slack**, which is
+the direction to err. The gate asserts sufficiency, not tightness.
+
+**A separate floor exists on CHUNK size, and it is not a context effect:**
+
+| chunk | 8 | 16 | 32 | 48 | 64 | 96 |
+|---|---|---|---|---|---|---|
+| max_abs | 1.4e-3 | 1.4e-3 | 2.5e-4 | **0.0** | **0.0** | **0.0** |
+
+Raising context from 11 → 128 changes these numbers *not at all*, which is what proves the drift
+is not a receptive-field shortfall: MLX selects different conv kernels for small inputs and their
+fp32 reduction order differs from the full-length path. Hence `minimumExactChunkFrames = 48` and a
+default of 64. (1.4e-3 on a [−1,1] waveform is ≈ −57 dBFS and inaudible, but "bit-identical" is
+worth keeping literally true.)
+
+### What it bought (`--stream`, same request, through the engine package)
+
+| | batch | streaming |
+|---|---|---|
+| wall clock | 10.33 s | 9.96 s |
+| peak activation | +5423 MB | **+3482 MB** (−36%) |
+| time to first audio | — | **2.41 s** |
+
+Aggregated streaming response is byte-identical in size to `run()`'s.
+
+The first implementation completed the whole AR rollout before decoding, giving a useless TTFA of
+9.51 s out of 9.90 s. Interleaving decode with generation — legitimate because `post_module` is
+causal, so running it over a prefix yields identical values for that prefix — brought it to
+**2.41 s**. The memory bound is the durable win: it no longer grows with utterance length.
+
 ### Not yet measured
 
 - Quantized (int8/int4) LM tier — no quantized variant published yet.

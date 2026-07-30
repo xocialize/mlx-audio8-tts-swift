@@ -382,6 +382,191 @@ func gateValidate() async throws {
     finish("VALIDATE")
 }
 
+
+// MARK: - S5: windowed decode must be BIT-IDENTICAL to the whole-utterance decode
+
+/// The streaming decode is only worth having if it is the SAME computation, chunked — not an
+/// approximation. This gate proves that: decode a real utterance whole, decode it again in
+/// chunks, and require max_abs == 0 exactly. It also runs a deliberately-too-small context to
+/// show the gate can fail — a bit-identity check that cannot fail is not evidence.
+func gateS5() throws {
+    // Stream selection is the variable under test here, so it is set explicitly:
+    // AUDIO8_S5_CPU=1 pins the CPU stream to separate ALGORITHMIC exactness from
+    // Metal's input-size-dependent kernel selection.
+    let onCPU = ProcessInfo.processInfo.environment["AUDIO8_S5_CPU"] == "1"
+    if onCPU { Device.setDefault(device: Device(.cpu)) }
+    print("  stream: \(onCPU ? "CPU" : "GPU")")
+    let goldens = loadGoldens()
+    let model = try Audio8TTS.load(directory: modelDir, lmDtype: .float32)
+    let codec = model.codec
+    let codes = goldens["gen.codes_greedy"]!.asType(.int32)
+    let frames = codes.shape[2]
+    let L = codec.leftReceptiveFieldFrames
+    print("  left receptive field: \(L) frames (\(String(format: "%.2f", Double(L) * 0.0464)) s)")
+
+    // Reference: one whole-utterance decode.
+    let whole = codec.decode(codes)
+    eval(whole)
+    let wholeSamples = whole.shape[1]
+
+    func streamedWaveform(chunkFrames: Int, context: Int?) throws -> MLXArray {
+        var pieces: [MLXArray] = []
+        try codec.decodeStreaming(codes, chunkFrames: chunkFrames, contextFrames: context) { s, _ in
+            pieces.append(s)
+        }
+        return concatenated(pieces, axis: 1)
+    }
+
+    // Exactness vs CHUNK SIZE. The context sweep below shows context is not the variable;
+    // window SIZE is, because MLX selects different conv kernels for small inputs and their
+    // fp32 reduction order differs from the whole-utterance path.
+    let floor = codec.minimumExactChunkFrames
+    for chunk in [8, 16, 32, 48, 64, 96, 128] {
+        let streamed = try streamedWaveform(chunkFrames: chunk, context: nil)
+        eval(streamed)
+        guard streamed.shape[1] == wholeSamples else {
+            failures.append("S5 chunk \(chunk): length \(streamed.shape[1]) vs \(wholeSamples)")
+            print("  FAIL chunk \(chunk): length mismatch")
+            continue
+        }
+        let diff = abs(whole - streamed).max().item(Float.self)
+        if chunk >= floor {
+            // At or above the measured floor the contract is EXACT equality.
+            if diff != 0 { failures.append("S5 chunk \(chunk): max_abs \(diff) (must be exactly 0)") }
+            print("  \(diff == 0 ? "ok  " : "FAIL") chunk \(chunk) frames: max_abs \(diff)  [exact]")
+        } else {
+            // Below it, drift is expected (small-input conv kernels) but must stay bounded and
+            // inaudible. Recorded rather than ignored — an unbounded drift here would be a bug.
+            let bounded = diff <= 2e-3
+            if !bounded { failures.append("S5 chunk \(chunk): sub-floor drift \(diff) exceeds 2e-3") }
+            print("  \(bounded ? "note" : "FAIL") chunk \(chunk) frames: max_abs \(diff)  "
+                  + "[below floor \(floor); drift expected, bounded]")
+        }
+    }
+
+    // Empirical context sweep: find the SMALLEST context that is exact at a small chunk size.
+    // The computed value is a claim; this is the measurement that settles it.
+    // Run this ABOVE the chunk floor, otherwise kernel-selection drift masks the very thing
+    // being measured (the first version of this sweep ran at chunk 8 and could never be exact,
+    // for reasons that had nothing to do with context).
+    print("  context sweep (chunk 64 — above the exactness floor):")
+    var minimumExact: Int?
+    for ctx in [0, 4, 8, 10, 11, 12, 16, 32] {
+        let s = try streamedWaveform(chunkFrames: 64, context: ctx)
+        eval(s)
+        let d = s.shape[1] == wholeSamples ? abs(whole - s).max().item(Float.self) : Float.nan
+        print("    L=\(ctx): max_abs \(d)")
+        if d == 0, minimumExact == nil { minimumExact = ctx }
+    }
+    if let minimumExact {
+        // The contract on a receptive-field bound is SUFFICIENCY, not tightness: the derived
+        // value must be >= the measured minimum. Being conservative costs a little compute per
+        // chunk; being short silently corrupts the seam. (Derived 11 vs measured 10 — the ceil()
+        // chain rounds up once more than strictly needed, which is the direction to err in.)
+        let sufficient = L >= minimumExact
+        print("  \(sufficient ? "ok  " : "FAIL") smallest exact context: \(minimumExact) frames; "
+              + "derived \(L) (\(sufficient ? "sufficient, +\(L - minimumExact) slack" : "TOO SHORT"))")
+        if !sufficient {
+            failures.append("S5: derived context \(L) is SHORT of the measured minimum "
+                            + "\(minimumExact) — windowed decode is not exact")
+        }
+    } else {
+        failures.append("S5: no context in the swept range produced an exact decode")
+    }
+
+    // Negative control: too little context MUST drift, otherwise the check above proves nothing.
+    let starved = try streamedWaveform(chunkFrames: 32, context: 0)
+    eval(starved)
+    let starvedDiff = abs(whole - starved).max().item(Float.self)
+    let drifts = starvedDiff > 0
+    if !drifts {
+        failures.append("S5 negative control: zero context produced an identical result — "
+                        + "the bit-identity gate is not actually testing anything")
+    }
+    print("  \(drifts ? "ok  " : "FAIL") negative control (0 context) drifts: max_abs \(starvedDiff)")
+
+    finish("S5")
+}
+
+
+// MARK: - STREAM live: does windowed decode actually bound memory and emit early?
+
+/// S5 proves the streamed waveform is bit-identical. This proves it is WORTH having: measures
+/// time-to-first-audio and peak activation for the streaming path against the batch path on the
+/// same request, through the real engine package.
+func gateStream() async throws {
+    let goldens = loadGoldens()
+    let refText = "You know, I was thinking about what you said earlier, and honestly, I think you might be right about the whole thing."
+    let refSamples: [Float] = goldens["ref_audio_44100"]!.asArray(Float.self)
+    let refURL = FileManager.default.temporaryDirectory.appendingPathComponent("audio8-stream-ref.wav")
+    try writeWav(refSamples, to: refURL)
+    let refAudio = Audio(format: .wav, data: try Data(contentsOf: refURL),
+                         sampleRate: 44100, channels: 1)
+
+    let package = Audio8Package(configuration: Audio8Configuration(modelDirectory: modelDir))
+    try await package.load()
+
+    let text = "This passage is long enough that streaming has something to prove: audio should "
+        + "start playing well before the last frame is generated, and the decoder's activation "
+        + "peak should stay bounded by the chunk rather than growing with the utterance."
+    func request() -> TTSRequest {
+        TTSRequest(text: text,
+                   voice: VoiceSelector(.referenceAudio(refAudio)),
+                   referenceTranscript: refText,
+                   metaData: ["seed": .int(11), "greedy": .bool(true), "maxFrames": .int(400)])
+    }
+
+    // Batch
+    GPU.resetPeakMemory()
+    let floor = MLX.Memory.activeMemory
+    let batchStart = Date()
+    let batchResponse = try await package.run(request())
+    let batchSeconds = Date().timeIntervalSince(batchStart)
+    let batchPeak = MLX.Memory.peakMemory - floor
+    let batchBytes = (batchResponse as? TTSResponse)?.audio.data.count ?? 0
+
+    // Streaming
+    GPU.resetPeakMemory()
+    var firstAudioAt: TimeInterval?
+    var chunks = 0
+    let streamStart = Date()
+    let streamResponse = try await package.runStream(request()) { chunk in
+        if firstAudioAt == nil { firstAudioAt = Date().timeIntervalSince(streamStart) }
+        chunks += 1
+        _ = chunk.isFinal
+    }
+    let streamSeconds = Date().timeIntervalSince(streamStart)
+    let streamPeak = MLX.Memory.peakMemory - floor
+    let streamBytes = (streamResponse as? TTSResponse)?.audio.data.count ?? 0
+
+    func mb(_ v: Int) -> Double { Double(v) / 1_048_576 }
+    print(String(format: "  batch:  %.2f s   peak +%.0f MB", batchSeconds, mb(batchPeak)))
+    print(String(format: "  stream: %.2f s   peak +%.0f MB   %d chunks   TTFA %.2f s",
+                 streamSeconds, mb(streamPeak), chunks, firstAudioAt ?? -1))
+
+    // STR-5: the aggregated streaming response must match what run() produced.
+    if batchBytes == streamBytes {
+        print("  ok   aggregated response identical in size (\(batchBytes) bytes)")
+    } else {
+        failures.append("stream aggregate \(streamBytes) bytes != batch \(batchBytes)")
+    }
+    // The point of the feature.
+    if streamPeak < batchPeak {
+        print(String(format: "  ok   streaming bounded the peak: %.0f MB saved (%.0f%%)",
+                     mb(batchPeak - streamPeak),
+                     100 * Double(batchPeak - streamPeak) / Double(max(batchPeak, 1))))
+    } else {
+        failures.append("streaming peak did not improve on batch")
+    }
+    if let ttfa = firstAudioAt, ttfa < batchSeconds {
+        print(String(format: "  ok   first audio %.2f s ahead of the batch result", batchSeconds - ttfa))
+    } else {
+        failures.append("no time-to-first-audio advantage")
+    }
+    await package.unload()
+    finish("STREAM")
+}
+
 // MARK: - CAN live: the MID-RUN checkpoint (the offline gate only proves the entry one)
 
 /// The offline `CancellationConformance.checkRun` cancels BEFORE `run()` starts, so it exercises
@@ -445,15 +630,17 @@ let mode = CommandLine.arguments.dropFirst().first ?? "--s1"
 stderrPrint("audio8-gates \(mode)  model=\(modelDir.path)")
 switch mode {
 case "--s0": try gateS0()
+case "--s5": try gateS5()
 case "--s1": try gateS1()
 case "--s2": try gateS2()
-case "--s2b", "--validate", "--cancel":
+case "--s2b", "--validate", "--cancel", "--stream":
     let semaphore = DispatchSemaphore(value: 0)
     Task {
         do {
             switch mode {
             case "--s2b": try await gateS2b()
             case "--cancel": try await gateCancel()
+            case "--stream": try await gateStream()
             default: try await gateValidate()
             }
         } catch {
@@ -464,6 +651,6 @@ case "--s2b", "--validate", "--cancel":
     }
     semaphore.wait()
 default:
-    stderrPrint("unknown mode \(mode); use --s0 | --s1 | --s2 | --s2b | --validate | --cancel")
+    stderrPrint("unknown mode \(mode); use --s0 | --s1 | --s2 | --s2b | --s5 | --validate | --cancel | --stream")
     exit(2)
 }

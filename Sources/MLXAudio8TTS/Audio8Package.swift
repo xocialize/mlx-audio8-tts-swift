@@ -27,7 +27,7 @@ import MLXToolKit
 /// - `seed` (int): reproducible sampling. Unlike the fleet's greedy-only packages this is
 ///   NOT a no-op — the default path samples.
 @InferenceActor
-public final class Audio8Package: ModelPackage {
+public final class Audio8Package: ModelPackage, StreamEmitting {
     public typealias Configuration = Audio8Configuration
 
     /// Split footprints — MEASURED, and revised twice. MEASUREMENTS.md carries every pass.
@@ -76,12 +76,14 @@ public final class Audio8Package: ModelPackage {
                 chipFloor: nil
             ),
             specialties: [
-                // Zero-shot cloning is the selection axis. Deliberately NOT .realtimeStreaming
-                // (whole-utterance decode, RTF ≈ 1) and NOT .emotionControl/.durationControl
+                // Zero-shot cloning is the selection axis. `.realtimeStreaming` is claimed only
+                // now that the windowed decode exists — before it, whole-utterance decoding made
+                // the claim false. NOT .emotionControl/.durationControl
                 // (no native control plane). The multilingual reach — 11 languages, the real
                 // differentiator vs the fleet's other cloners — has no registered Specialty
                 // term; it is stated in the surface summary instead of inventing vocabulary.
                 SpecialtyWeight(.voiceClone, strength: 1.0),
+                SpecialtyWeight(.realtimeStreaming, strength: 0.7),
             ],
             surfaces: [
                 TTSContract.descriptor(
@@ -92,8 +94,12 @@ public final class Audio8Package: ModelPackage {
                         + "the model's default voice. 11 languages: Cantonese, Chinese, Dutch, "
                         + "English, French, German, Italian, Japanese, Korean, Polish, Spanish. "
                         + "DualAR architecture at 21.5 frames/s; whole-utterance synthesis "
-                        + "(no streaming). metaData: temperature/topP/topK/seed/greedy/maxFrames.",
-                    modes: [.neutral]
+                        + "metaData: temperature/topP/topK/seed/greedy/maxFrames/streamChunkFrames. "
+                        + "Streams PCM chunks: the codec decoder is strictly causal, so the "
+                        + "windowed incremental decode is bit-identical to the whole-utterance "
+                        + "one (gated) while bounding activation by the chunk.",
+                    modes: [.neutral],
+                    streaming: .audioChunk
                 )
             ]
         )
@@ -162,6 +168,45 @@ public final class Audio8Package: ModelPackage {
         // `onFrame` predicate, and the CancellationError is rethrown UNCHANGED so the engine can
         // classify user-cancel vs governor-preempt.
         try Task.checkCancellation()
+        let (model, conditioning, params) = try prepared(for: request)
+        try Task.checkCancellation()
+
+        // The DualAR rollout, then the codec decode. Cancellation + progress ride the per-frame
+        // seam; `Task.checkCancellation` throws CancellationError, which propagates UNCHANGED
+        // through the core's rethrowing `onFrame` so the engine can classify it (CAN-2).
+        let result = try await model.generate(
+            text: conditioning.text,
+            referenceCodes: conditioning.codes,
+            referenceLength: conditioning.length,
+            referenceText: conditioning.transcript,
+            params: params,
+            onFrame: { count in
+                RunProgress.report(.generate, step: count)
+                try Task.checkCancellation()
+            })
+        try Task.checkCancellation()
+
+        RunProgress.report(.decode)
+        let samples: [Float] = result.audio.asArray(Float.self)
+        let wav = AudioSupport.encodeWAV16(samples: samples, sampleRate: result.sampleRate)
+        return TTSResponse(audio: Audio(
+            format: .wav, data: wav, sampleRate: result.sampleRate, channels: 1))
+    }
+
+    // MARK: - Shared conditioning (run + runStream)
+
+    struct Conditioning {
+        let text: String
+        let codes: MLXArray?
+        let length: Int
+        let transcript: String?
+    }
+
+    /// Voice guard → memoized reference codes → metaData-plane sampling options. Shared by
+    /// `run()` and `runStream()` so the two paths cannot drift apart — the failure mode where a
+    /// streaming twin quietly conditions differently from its batch sibling.
+    private func prepared(for request: any CapabilityRequest) throws
+        -> (Audio8TTS, Conditioning, SamplingParams) {
         guard let model else { throw PackageError.notLoaded }
         guard request.capability == .tts, let tts = request as? TTSRequest else {
             throw PackageError.unsupportedCapability(request.capability)
@@ -201,8 +246,6 @@ public final class Audio8Package: ModelPackage {
                 + "voice.referenceAudio with a referenceTranscript, or voice.auto")
         }
 
-        try Task.checkCancellation()
-
         // metaData plane.
         var params = SamplingParams()
         if let value = tts.metaData.intValue("maxFrames") { params.maxNewTokens = max(1, value) }
@@ -218,26 +261,60 @@ public final class Audio8Package: ModelPackage {
             params.seed = UInt64(bitPattern: Int64(seed))
         }
 
-        // The DualAR rollout, then the codec decode. Cancellation + progress ride the per-frame
-        // seam; `Task.checkCancellation` throws CancellationError, which propagates UNCHANGED
-        // through the core's rethrowing `onFrame` so the engine can classify it (CAN-2).
-        let result = try await model.generate(
-            text: tts.text,
-            referenceCodes: referenceCodes,
-            referenceLength: referenceLength,
-            referenceText: referenceText,
+        return (model, Conditioning(text: tts.text, codes: referenceCodes,
+                                    length: referenceLength, transcript: referenceText), params)
+    }
+
+    // MARK: - Streaming (StreamEmitting)
+
+    /// Streaming twin of `run()`: same conditioning, same AR rollout, but the codec decode is
+    /// windowed and incremental, so audio leaves before the utterance finishes and peak
+    /// activation is bounded by the chunk rather than by utterance length.
+    ///
+    /// Exactness is not assumed: the decoder stack below `post_module` is strictly causal, and
+    /// the `--s5` gate proves the chunked decode is bit-identical (max_abs exactly 0) to the
+    /// whole-utterance decode at the default chunk size. Returns the same aggregated response
+    /// `run()` would have produced.
+    ///
+    /// `metaData.streamChunkFrames` (int) tunes the cadence; it is clamped to the codec's
+    /// measured exactness floor, below which small-input conv kernels break bit-identity.
+    public func runStream(_ request: any CapabilityRequest,
+                          emit: @escaping @Sendable (TTSStreamChunk) -> Void)
+        async throws -> any CapabilityResponse {
+        try Task.checkCancellation()   // entry checkpoint precedes the first emit
+        let (model, conditioning, params) = try prepared(for: request)
+        try Task.checkCancellation()
+
+        let tts = request as? TTSRequest
+        let requested = tts?.metaData.intValue("streamChunkFrames") ?? 64
+        var index = 0
+        var all: [Float] = []
+
+        let result = try await model.generateStreaming(
+            text: conditioning.text,
+            referenceCodes: conditioning.codes,
+            referenceLength: conditioning.length,
+            referenceText: conditioning.transcript,
             params: params,
+            chunkFrames: requested,
             onFrame: { count in
                 RunProgress.report(.generate, step: count)
                 try Task.checkCancellation()
+            },
+            onChunk: { samples, isFinal in
+                emit(TTSStreamChunk(samples: samples,
+                                    sampleRate: ArkttsCodec.sampleRate,
+                                    index: index, isFinal: isFinal))
+                index += 1
+                all.append(contentsOf: samples)
             })
         try Task.checkCancellation()
 
         RunProgress.report(.decode)
-        let samples: [Float] = result.audio.asArray(Float.self)
-        let wav = AudioSupport.encodeWAV16(samples: samples, sampleRate: result.sampleRate)
+        _ = result
+        let wav = AudioSupport.encodeWAV16(samples: all, sampleRate: ArkttsCodec.sampleRate)
         return TTSResponse(audio: Audio(
-            format: .wav, data: wav, sampleRate: result.sampleRate, channels: 1))
+            format: .wav, data: wav, sampleRate: ArkttsCodec.sampleRate, channels: 1))
     }
 
     /// In-memory cache key for a reference clip (Hasher is per-process seeded, which is all we

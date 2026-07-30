@@ -184,6 +184,77 @@ public final class Audio8TTS: @unchecked Sendable {
             params: params, onFrame: onFrame)
     }
 
+    /// Streaming twin of `generate`: identical AR rollout, but the codec decode is windowed
+    /// and incremental, so each chunk's samples are handed to `onChunk` as soon as they exist
+    /// and peak activation is bounded by the chunk instead of the utterance.
+    ///
+    /// Returns the same aggregated result `generate` would have produced — the streamed chunks
+    /// concatenate to exactly that waveform (proven bit-identical by the `--s5` gate at the
+    /// default chunk size).
+    public func generateStreaming(
+        text: String,
+        referenceCodes: MLXArray?,
+        referenceLength: Int,
+        referenceText: String? = nil,
+        params: SamplingParams = SamplingParams(),
+        chunkFrames: Int? = nil,
+        onFrame: ((Int) throws -> Void)? = nil,
+        onChunk: @escaping ([Float], Bool) throws -> Void
+    ) async throws -> Audio8GenerationResult {
+        let start = Date()
+        let (prefix, suffix) = try await promptSegments(
+            text: text, referenceText: referenceText, hasReference: referenceCodes != nil)
+
+        // INTERLEAVED: decode and emit while the rollout is still running. `post_module` is
+        // causal, so running it over a PREFIX yields identical values for every position in that
+        // prefix as running it over the whole sequence — which is what makes decoding ahead of
+        // the final frame legitimate rather than approximate.
+        var emitted: [MLXArray] = []
+        var pieces: [MLXArray] = []
+        var decodedUpTo = 0
+        let chunk = max(codec.minimumExactChunkFrames, chunkFrames ?? 64)
+        let context = codec.leftReceptiveFieldFrames
+
+        func drain(force: Bool) throws {
+            while emitted.count - decodedUpTo >= chunk || (force && decodedUpTo < emitted.count) {
+                let end = force ? emitted.count : min(decodedUpTo + chunk, emitted.count)
+                guard end > decodedUpTo else { break }
+                let windowStart = max(0, decodedUpTo - context)
+                let window = concatenated(Array(emitted[windowStart ..< end]), axis: 2)
+                let latent = codec.postModuleLatent(window)
+                let decoded = codec.decodeFromLatent(latent)
+                let drop = (decodedUpTo - windowStart) * ArkttsCodec.frameLength
+                let mono = decoded[0, drop...].asType(.float32)
+                eval(mono)
+                let isFinal = force && end == emitted.count
+                try onChunk(mono.asArray(Float.self), isFinal)
+                pieces.append(mono)
+                decodedUpTo = end
+                if force { break }
+            }
+        }
+
+        let codes = try lm.generateCodes(
+            prefix: prefix, suffix: suffix,
+            referenceCodes: referenceCodes, referenceLength: referenceLength,
+            params: params,
+            onFrame: onFrame,
+            onFrameCodes: { frame in
+                emitted.append(frame.expandedDimensions(axis: 2))
+                try drain(force: false)
+            })
+        eval(codes)
+        let frames = codes.shape[2]
+        guard frames > 0 else { throw Audio8TTSError.emptyGeneration }
+        try drain(force: true)
+
+        let waveform = concatenated(pieces, axis: 0)
+        eval(waveform)
+        return Audio8GenerationResult(
+            audio: waveform, frames: frames, sampleRate: ArkttsCodec.sampleRate,
+            elapsed: Date().timeIntervalSince(start))
+    }
+
     /// Generation from PRE-ENCODED reference codes (see `encodeReference`).
     public func generate(
         text: String,
