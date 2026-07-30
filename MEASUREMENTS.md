@@ -262,6 +262,42 @@ every value was a bet on how long an utterance a caller would ask for — a bet 
 `maxFrames` no longer affects memory at all, only duration. `--s5` still passes, so the audio is
 unchanged: this is the same computation, windowed.
 
+## 2026-07-30 (sixth pass) — a correctness regression, and the throughput cost
+
+**v0.2.1 shipped an approximate decode.** The interleaved streaming path windowed at the *codes*
+level and re-ran `post_module` per window. That is wrong twice over: its receptive field is 1016
+frames, and its RoPE is absolute, so a window starting at frame N re-phases those positions as
+if they were 0..k. The output was plausible audio of exactly the right length — and since
+`generate` had been routed through that path, **batch inherited it too**.
+
+Two gates failed to catch it, both instructively:
+
+- `--s5` tests `decodeStreaming`, which runs `post_module` once and windows only the conv stack.
+  It was correct and stayed green. The bug was in a *different* function.
+- `--stream` compared the aggregated response by **byte count**. An approximate decode produces
+  exactly as many samples as an exact one, so that check could not fail on the only bug that
+  mattered. It now compares content, and that is what caught this.
+
+Fixed: `post_module` runs over the full prefix (exact, because it is causal) and only
+`decodeFromLatent` is windowed, at its 11-frame field. `generate` no longer delegates to the
+streaming path at all — that path's prefix recomputation is quadratic work a batch caller has no
+use for. Streamed output is now **byte-identical** to batch.
+
+### The throughput cost of a bounded envelope
+
+Measured over two 18-run app sweeps, same machine, same corpus:
+
+| | unbounded decode (v0.1.0) | windowed decode (v0.2.2) |
+|---|---|---|
+| median RTF | **0.94** | **1.23** |
+| max transient | 6.20 GB | **3.43 GB** |
+
+Roughly **30% throughput for a flat envelope**. Worth it here: the governor reserves
+`peakActivationBytes` for the whole process, so a constant 4.2 GB beats a length-dependent figure
+reaching ~30 GB at the `maxFrames` ceiling — and RTF 1.23 is still near realtime. Chunk size is
+the tuning knob (`streamChunkFrames`): larger chunks amortize the re-decoded context overlap
+(64+11 frames per 64 emitted ⇒ ~17%) at a slightly higher peak.
+
 ### Not yet measured
 
 - Quantized (int8/int4) LM tier — no quantized variant published yet.

@@ -544,20 +544,33 @@ func gateStream() async throws {
     print(String(format: "  stream: %.2f s   peak +%.0f MB   %d chunks   TTFA %.2f s",
                  streamSeconds, mb(streamPeak), chunks, firstAudioAt ?? -1))
 
-    // STR-5: the aggregated streaming response must match what run() produced.
-    if batchBytes == streamBytes {
-        print("  ok   aggregated response identical in size (\(batchBytes) bytes)")
-    } else {
+    // STR-5: the aggregated streaming response must match what run() produced — by CONTENT,
+    // not by size. Comparing byte counts is a gate that cannot fail on the interesting bug:
+    // an approximate decode produces exactly as many samples as an exact one. (It did, and this
+    // check is why that was caught.)
+    let batchData = (batchResponse as? TTSResponse)?.audio.data ?? Data()
+    let streamData = (streamResponse as? TTSResponse)?.audio.data ?? Data()
+    if batchData == streamData {
+        print("  ok   aggregated response byte-identical to batch (\(batchBytes) bytes)")
+    } else if batchBytes != streamBytes {
         failures.append("stream aggregate \(streamBytes) bytes != batch \(batchBytes)")
+        print("  FAIL length differs: \(streamBytes) vs \(batchBytes)")
+    } else {
+        let differing = zip(batchData, streamData).filter { $0 != $1 }.count
+        failures.append("stream aggregate same length but \(differing) bytes differ from batch")
+        print("  FAIL same length, \(differing) bytes differ — the streamed decode is not exact")
     }
     // The point of the feature.
-    if streamPeak < batchPeak {
-        print(String(format: "  ok   streaming bounded the peak: %.0f MB saved (%.0f%%)",
-                     mb(batchPeak - streamPeak),
-                     100 * Double(batchPeak - streamPeak) / Double(max(batchPeak, 1))))
-    } else {
-        failures.append("streaming peak did not improve on batch")
-    }
+    // Both paths are windowed now, so the meaningful assertion is that each is BOUNDED —
+    // parity between them is the expected outcome, not a failure. (An earlier version demanded
+    // streaming < batch, which stopped being the right question once batch was fixed too.)
+    let bound = 4_200_000_000  // the declared peakActivationBytes
+    let bothBounded = batchPeak < bound && streamPeak < bound
+    print(String(format: "  %@ both paths within the declared %.1f GB envelope "
+                 + "(batch %.0f MB, stream %.0f MB)",
+                 bothBounded ? "ok  " : "FAIL", Double(bound) / 1e9,
+                 mb(batchPeak), mb(streamPeak)))
+    if !bothBounded { failures.append("a decode path exceeded the declared activation envelope") }
     if let ttfa = firstAudioAt, ttfa < batchSeconds {
         print(String(format: "  ok   first audio %.2f s ahead of the batch result", batchSeconds - ttfa))
     } else {

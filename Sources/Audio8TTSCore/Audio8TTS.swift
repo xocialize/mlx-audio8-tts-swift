@@ -219,10 +219,17 @@ public final class Audio8TTS: @unchecked Sendable {
             while emitted.count - decodedUpTo >= chunk || (force && decodedUpTo < emitted.count) {
                 let end = force ? emitted.count : min(decodedUpTo + chunk, emitted.count)
                 guard end > decodedUpTo else { break }
+                // `post_module` runs over the FULL prefix, never a window. Two reasons it cannot
+                // be windowed here, both of which produce plausible-but-wrong audio rather than
+                // an error: its receptive field is 1016 frames (8 stacked 128-wide layers), and
+                // its RoPE is absolute — a window starting at frame N would re-phase those
+                // positions as if they were 0..k. Running it on the prefix is exact because the
+                // module is causal, and cheap because it is a 1024-wide transformer, not the
+                // conv stack. ONLY `decodeFromLatent` is windowed, at its 11-frame field.
+                let prefix = concatenated(Array(emitted[0 ..< end]), axis: 2)
+                let latentAll = codec.postModuleLatent(prefix)
                 let windowStart = max(0, decodedUpTo - context)
-                let window = concatenated(Array(emitted[windowStart ..< end]), axis: 2)
-                let latent = codec.postModuleLatent(window)
-                let decoded = codec.decodeFromLatent(latent)
+                let decoded = codec.decodeFromLatent(latentAll[0..., windowStart ..< end])
                 let drop = (decodedUpTo - windowStart) * ArkttsCodec.frameLength
                 let mono = decoded[0, drop...].asType(.float32)
                 eval(mono)
@@ -257,12 +264,11 @@ public final class Audio8TTS: @unchecked Sendable {
 
     /// Generation from PRE-ENCODED reference codes (see `encodeReference`).
     ///
-    /// Delegates to `generateStreaming` with a discarding sink. That is not a shortcut — the
-    /// windowed decode is bit-identical to the whole-utterance one (gated by `--s5`), and it
-    /// bounds activation instead of growing it with utterance length. Measured: batch decode
-    /// climbs 3457 → 4993 MB over 64 → 224 frames and reaches ~16 GB at 1035, while the windowed
-    /// path stays FLAT at ~3482 MB across the same range. There is no reason to keep an
-    /// unbounded decode for callers who happen not to want the chunks.
+    /// Uses the windowed decode — bit-identical to a whole-utterance decode (`--s5`) but with a
+    /// FLAT activation envelope instead of one linear in frames. It does NOT go through
+    /// `generateStreaming`: that path re-runs `post_module` on a growing prefix for every chunk
+    /// to get audio out early, which is quadratic work a batch caller has no use for. Here
+    /// `post_module` runs exactly once and only the conv stack is windowed.
     public func generate(
         text: String,
         referenceCodes: MLXArray?,
@@ -271,9 +277,28 @@ public final class Audio8TTS: @unchecked Sendable {
         params: SamplingParams = SamplingParams(),
         onFrame: ((Int) throws -> Void)? = nil
     ) async throws -> Audio8GenerationResult {
-        try await generateStreaming(
-            text: text, referenceCodes: referenceCodes, referenceLength: referenceLength,
-            referenceText: referenceText, params: params,
-            onFrame: onFrame, onChunk: { _, _ in })
+        let start = Date()
+        let (prefix, suffix) = try await promptSegments(
+            text: text, referenceText: referenceText, hasReference: referenceCodes != nil)
+
+        let codes = try lm.generateCodes(
+            prefix: prefix, suffix: suffix,
+            referenceCodes: referenceCodes, referenceLength: referenceLength,
+            params: params, onFrame: onFrame)
+        eval(codes)
+        let frames = codes.shape[2]
+        guard frames > 0 else { throw Audio8TTSError.emptyGeneration }
+
+        var pieces: [MLXArray] = []
+        try codec.decodeStreaming(codes) { samples, _ in
+            let mono = samples[0].asType(.float32)
+            eval(mono)
+            pieces.append(mono)
+        }
+        let waveform = concatenated(pieces, axis: 0)
+        eval(waveform)
+        return Audio8GenerationResult(
+            audio: waveform, frames: frames, sampleRate: ArkttsCodec.sampleRate,
+            elapsed: Date().timeIntervalSince(start))
     }
 }
