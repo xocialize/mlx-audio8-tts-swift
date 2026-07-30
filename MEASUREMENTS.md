@@ -287,12 +287,15 @@ use for. Streamed output is now **byte-identical** to batch.
 
 Measured over two 18-run app sweeps, same machine, same corpus:
 
-| | unbounded decode (v0.1.0) | windowed decode (v0.2.2) |
-|---|---|---|
-| median RTF | **0.94** | **1.23** |
-| max transient | 6.20 GB | **3.43 GB** |
+| | v0.1.0 unbounded | v0.2.1 (batch on the streaming path) | v0.2.2 batch decoupled |
+|---|---|---|---|
+| median RTF | **0.94** | 1.23 | **1.07** |
+| max transient | 6.20 GB | 3.43 GB | **3.85 GB** |
 
-Roughly **30% throughput for a flat envelope**. Worth it here: the governor reserves
+Roughly **14% throughput for a flat envelope** — not the 30% the v0.2.1 measurement suggested.
+Most of that apparent cost was batch needlessly paying the streaming path's quadratic
+`post_module` recomputation; decoupling it recovered the difference. The residual 14% is the
+real price: re-decoding 11 frames of context per 64 emitted. Worth it here: the governor reserves
 `peakActivationBytes` for the whole process, so a constant 4.2 GB beats a length-dependent figure
 reaching ~30 GB at the `maxFrames` ceiling — and RTF 1.23 is still near realtime. Chunk size is
 the tuning knob (`streamChunkFrames`): larger chunks amortize the re-decoded context overlap
