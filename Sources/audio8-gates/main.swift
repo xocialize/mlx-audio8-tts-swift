@@ -11,6 +11,8 @@
 import Foundation
 import MLX
 import Audio8TTSCore
+import MLXAudio8TTS
+import MLXToolKit
 
 // MARK: paths
 
@@ -174,7 +176,7 @@ func gateS2() throws {
     // greedy generation: token-exact vs the oracle
     let prefix: [Int32] = goldens["proc.prefix_input_ids"]![0].asArray(Int32.self)
     let suffix: [Int32] = goldens["proc.suffix_input_ids"]![0].asArray(Int32.self)
-    let generated = lm.generateCodes(
+    let generated = try lm.generateCodes(
         prefix: prefix, suffix: suffix,
         referenceCodes: refCodes[0], referenceLength: refCodeLen,
         params: SamplingParams(maxNewTokens: 200, doSample: false))
@@ -237,6 +239,148 @@ func gateS2b() async throws {
     finish("S2b")
 }
 
+// MARK: - S7 / --validate: the ENGINE path, headless, with a measured footprint
+
+/// Real-process resident memory (mach phys_footprint) in MB — the app-truth footprint.
+/// MLX's own GPU peak under-reads vs phys, so both are reported.
+func physFootprintMB() -> Double {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(
+        MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
+    let kr = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+        }
+    }
+    return kr == KERN_SUCCESS ? Double(info.phys_footprint) / 1_048_576.0 : -1
+}
+
+func mb(_ bytes: Int) -> Double { Double(bytes) / 1_048_576.0 }
+
+/// Drives the real `Audio8Package` through register-equivalent lifecycle (construct → load →
+/// run → unload) and reports the numbers the manifest must declare. This is the measurement
+/// of record for `bf16ResidentBytes` / `peakActivationBytes`.
+func gateValidate() async throws {
+    let goldens = loadGoldens()
+    let refText = "You know, I was thinking about what you said earlier, and honestly, I think you might be right about the whole thing."
+
+    // A reference clip as the canonical Audio artifact the engine would hand us.
+    let refSamples: [Float] = goldens["ref_audio_44100"]!.asArray(Float.self)
+    let refWavURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("audio8-validate-ref.wav")
+    try writeWav(refSamples, to: refWavURL)
+    let refAudio = Audio(format: .wav, data: try Data(contentsOf: refWavURL),
+                         sampleRate: 44100, channels: 1)
+
+    let baseline = physFootprintMB()
+    MLX.Memory.clearCache()
+    let package = Audio8Package(
+        configuration: Audio8Configuration(modelDirectory: modelDir))
+
+    // --- load ---
+    let loadStart = Date()
+    try await package.load()
+    let loadSeconds = Date().timeIntervalSince(loadStart)
+    // Resident floor is measured POST-LOAD, before any run allocates a transient.
+    let residentActive = MLX.Memory.activeMemory
+    let residentPhys = physFootprintMB()
+    GPU.resetPeakMemory()
+
+    // --- run (through the engine-facing surface, not the core) ---
+    let request = TTSRequest(
+        text: "Validation run through the engine package surface. This sentence is long enough "
+            + "to exercise a realistic single-utterance transient in the codec decoder.",
+        voice: VoiceSelector(.referenceAudio(refAudio)),
+        referenceTranscript: refText,
+        metaData: ["seed": .int(4242), "maxFrames": .int(400)])
+    let runStart = Date()
+    let response = try await package.run(request)
+    let runSeconds = Date().timeIntervalSince(runStart)
+    let peakActive = MLX.Memory.peakMemory
+    let peakPhys = physFootprintMB()
+
+    guard let tts = response as? TTSResponse else {
+        failures.append("run() did not return a TTSResponse")
+        return finish("VALIDATE")
+    }
+
+    // Quantify the audio — a silent stem reads −∞ dBFS; never trust ears alone.
+    let pcm = tts.audio.data.dropFirst(44)
+    let channels = tts.audio.channels ?? 1
+    var decoded = [Float]()
+    decoded.reserveCapacity(pcm.count / 2)
+    var iterator = pcm.makeIterator()
+    while let low = iterator.next(), let high = iterator.next() {
+        let sample = Int16(bitPattern: UInt16(low) | (UInt16(high) << 8))
+        decoded.append(Float(sample) / 32767)
+    }
+    let rms = (decoded.reduce(Float(0)) { $0 + $1 * $1 } / Float(max(decoded.count, 1))).squareRoot()
+    let dbfs = 20 * log10(rms + 1e-12)
+    let duration = Double(decoded.count) / Double(tts.audio.sampleRate ?? 44100)
+
+    print("  ok   response: .\(tts.audio.format) \(tts.audio.sampleRate) Hz "
+          + "\(channels)ch, \(decoded.count) samples")
+    print(String(format: "  %@ audio level %.1f dBFS over %.2fs",
+                 dbfs > -60 ? "ok  " : "FAIL", dbfs, duration))
+    if dbfs <= -60 { failures.append("silent output (\(dbfs) dBFS)") }
+    print(String(format: "  load %.2fs · run %.2fs · RTF %.2f", loadSeconds, runSeconds,
+                 duration > 0 ? runSeconds / duration : 0))
+
+    // --- the footprint table (what the manifest must declare) ---
+    print("")
+    print(String(format: "  baseline phys           %8.0f MB", baseline))
+    print(String(format: "  RESIDENT  MLX-active    %8.0f MB   phys %.0f MB",
+                 mb(residentActive), residentPhys))
+    print(String(format: "  PEAK      MLX-high-water%8.0f MB   phys %.0f MB",
+                 mb(peakActive), peakPhys))
+    let transient = max(0, mb(peakActive) - mb(residentActive))
+    print(String(format: "  transient (peak − resident) %6.0f MB", transient))
+    print("")
+    // NOTE the split-footprint semantics: `peakActivationBytes` is the TRANSIENT (peak minus
+    // resident), not the absolute high-water — the engine adds it to the resident floor when
+    // admitting. Declaring the absolute peak here would double-count the weights.
+    print("  DECLARE → residentBytes: \(UInt64(Double(residentActive) * 1.07))")
+    print("            peakActivationBytes: \(UInt64(transient * 1_048_576 * 1.13))"
+          + "   (= transient, NOT absolute peak)")
+    print("  (resident ×1.07, transient ×1.13 margin — the fleet convention)")
+
+    // --- unload must actually release ---
+    // Attribute what remains: MLX's own accounting (active = live arrays, cache = the buffer
+    // pool MLX retains for reuse) vs process phys. A large phys with near-zero MLX-active is the
+    // allocator/pool holding pages, NOT a package leak — the distinction the fleet's
+    // "memory never releases" reports keep tripping over.
+    await package.unload()
+    let afterUnload = physFootprintMB()
+    print(String(format: "\n  unload → phys %.0f MB (released %.0f MB)",
+                 afterUnload, peakPhys - afterUnload))
+    print(String(format: "  post-unload MLX: active %.0f MB · cache %.0f MB · peak %.0f MB",
+                 mb(MLX.Memory.activeMemory), mb(MLX.Memory.cacheMemory),
+                 mb(MLX.Memory.peakMemory)))
+    if mb(MLX.Memory.activeMemory) > 256 {
+        failures.append(String(format: "MLX still holds %.0f MB active after unload",
+                               mb(MLX.Memory.activeMemory)))
+    }
+
+    // --- transient scaling: the peak is utterance-length-driven, so show the slope ---
+    GPU.resetPeakMemory()
+    let shortPackage = Audio8Package(
+        configuration: Audio8Configuration(modelDirectory: modelDir))
+    try await shortPackage.load()
+    let shortResident = MLX.Memory.activeMemory
+    GPU.resetPeakMemory()
+    let shortRequest = TTSRequest(
+        text: "A short line.",
+        voice: VoiceSelector(.referenceAudio(refAudio)),
+        referenceTranscript: refText,
+        metaData: ["seed": .int(4242), "maxFrames": .int(60)])
+    _ = try await shortPackage.run(shortRequest)
+    print(String(format: "\n  short utterance: resident %.0f MB · peak %.0f MB (transient %.0f MB)",
+                 mb(shortResident), mb(MLX.Memory.peakMemory),
+                 mb(MLX.Memory.peakMemory) - mb(shortResident)))
+    await shortPackage.unload()
+    finish("VALIDATE")
+}
+
 // MARK: entry
 
 let mode = CommandLine.arguments.dropFirst().first ?? "--s1"
@@ -245,17 +389,19 @@ switch mode {
 case "--s0": try gateS0()
 case "--s1": try gateS1()
 case "--s2": try gateS2()
-case "--s2b":
+case "--s2b", "--validate":
     let semaphore = DispatchSemaphore(value: 0)
     Task {
-        do { try await gateS2b() } catch {
-            stderrPrint("S2b error: \(error)")
+        do {
+            if mode == "--s2b" { try await gateS2b() } else { try await gateValidate() }
+        } catch {
+            stderrPrint("\(mode) error: \(error)")
             exit(1)
         }
         semaphore.signal()
     }
     semaphore.wait()
 default:
-    stderrPrint("unknown mode \(mode); use --s0 | --s1 | --s2 | --s2b")
+    stderrPrint("unknown mode \(mode); use --s0 | --s1 | --s2 | --s2b | --validate")
     exit(2)
 }

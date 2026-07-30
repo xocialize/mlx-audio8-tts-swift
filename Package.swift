@@ -40,7 +40,7 @@ let package = Package(
         .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.31.5"),
         // Qwen byte-level BPE (tokenizer.json) for the prompt builder.
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.33.0"),
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.40.1"),
     ],
     targets: [
         .target(
@@ -82,6 +82,7 @@ let package = Package(
                 "Audio8TTSCore",
                 "MLXAudio8TTS",
                 .product(name: "MLXServeConformance", package: "mlx-engine-swift"),
+                .product(name: "MLXServeConformanceNN", package: "mlx-engine-swift"),
                 .product(name: "MLXServeCore", package: "mlx-engine-swift"),
             ],
             path: "Tests/MLXAudio8TTSTests"

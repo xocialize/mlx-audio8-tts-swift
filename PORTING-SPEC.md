@@ -21,9 +21,9 @@ transposes, no key remapping beyond the dotted-path → module-tree walk.
 | S1b | codec units: encoder, resunit, pre_module, qdecode, full decode (CPU stream, fp32) | PASSED 2026-07-30 (encoder 3.2e-6, resunit 2.1e-6, pre_module 9.1e-4, qdecode 3.5e-5, full decode 8.7e-6) |
 | S2 | e2e prefill: prompt fixture → logits_last / hidden_last ≤ 1e-2; codec encode of ref clip 100% code-exact; greedy 200-frame generation 100% token-exact; waveform ≤ 5e-3 | PASSED 2026-07-30 (encode 100% code-exact; greedy **102/102 frames token-exact**; logits 1.0e-4; waveform 4.6e-6) |
 | S2b | prompt entry + GPU: tokenizer → prompt ids == proc.* fixtures; ONE real sampled generation on GPU (bf16 LM + fp32 codec), dBFS-quantified | PASSED 2026-07-30 (prompt ids exact 52+28; 127 frames / 5.90 s @ −18.5 dBFS, RTF 1.30) |
-| S5 | (optional) KV-slice decode optimization gated bit-identical vs full-buffer path | — |
+| S5 | (optional) KV-slice decode optimization gated bit-identical vs full-buffer path | not done — see "Open optimizations" |
 | S6 | quantized LM variant (int8/int4) per-pass cosine on GPU CLI lane | — |
-| S7 | engine wrap → Stage 2 | — |
+| S7 | engine wrap: manifest + MAT-1..5 + CAN-1..3 + C14/INF (15 offline tests) and `--validate` through the real package (load → run → unload, measured footprint) | PASSED 2026-07-30 (15/15 offline; validate RTF 0.96, −18.8 dBFS, resident 2434 MB / transient 4413 MB — MEASUREMENTS.md) |
 
 ## Numerics contract (from the Python port — verified traps)
 
@@ -59,3 +59,17 @@ Codec fixtures are channels-first from torch: transpose (0,2,1) to compare with
 NLC Swift outputs. `unit.codes_in` / code fixtures are int32. `prompt.ids`
 (1, 11, T) int32. Reference audio fixture `ref_audio_44100` is pre-resampled —
 resampler parity is decoupled (wrapper uses its own windowed-sinc at runtime).
+
+
+## Open optimizations (measured, not speculative)
+
+1. **Windowed codec decode.** `--validate` measured the run transient at **4413 MB** for a 9.2 s
+   utterance vs **1623 MB** for a short line — it scales with utterance length because the codec
+   decodes the whole utterance through its conv stack in one pass. A windowed/incremental decode
+   (the decoder is causal, as Gepard's streaming work established for its own codec) would flatten
+   this AND unlock `StreamEmitting`. Biggest single win available.
+2. **KV-cache slicing (S5).** The cache is a full `max_seq_len` (2048) buffer with a validity mask,
+   isomorphic to the reference. Slicing to the valid prefix cuts per-step attention work; gate it
+   bit-identical against the full-buffer path.
+3. **Quantized LM tier (S6).** No quantized variant is published yet. Run the quant gate in the
+   **GPU** CLI lane — a CPU-pinned quantized forward silently grinds for hours.

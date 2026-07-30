@@ -83,6 +83,11 @@ public final class Audio8TTS: @unchecked Sendable {
         try lm.update(
             parameters: ModuleParameters.unflattened(lmWeights.map { ($0.key, $0.value) }),
             verify: .all)
+        // C14/INF: MLXNN.Module.training defaults to TRUE. Nothing in this graph branches on it
+        // today (Linear/Embedding + a hand-rolled RMSNorm — no BatchNorm, no Dropout), but the
+        // single construction choke point is the right place to pin inference mode so a future
+        // layer addition cannot silently inherit training semantics.
+        lm.train(false)
         eval(lm.parameters())
 
         let codec = ArkttsCodec(weights: codecWeights, config: config)
@@ -153,29 +158,46 @@ public final class Audio8TTS: @unchecked Sendable {
 
     // MARK: generation
 
+    /// Encodes a reference clip to codec codes. Split out so callers doing long-form synthesis
+    /// can encode ONCE and reuse across many `generate(...)` calls — the codec encoder is the
+    /// expensive part of conditioning.
+    /// - Parameter audio: mono fp32 samples at 44.1 kHz (resampling is the caller's concern).
+    public func encodeReference(_ audio: MLXArray) -> (codes: MLXArray, length: Int) {
+        let (codes, length) = codec.encode(
+            audio.expandedDimensions(axis: 0), sampleCount: audio.shape[0])
+        eval(codes)
+        return (codes[0], length)
+    }
+
     /// referenceAudio: mono fp32 samples at 44.1 kHz (resampling is the caller's concern).
     public func generate(
         text: String,
         referenceAudio: MLXArray? = nil,
         referenceText: String? = nil,
         params: SamplingParams = SamplingParams(),
-        onFrame: ((Int) -> Bool)? = nil
+        onFrame: ((Int) throws -> Void)? = nil
+    ) async throws -> Audio8GenerationResult {
+        let reference = referenceAudio.map { encodeReference($0) }
+        return try await generate(
+            text: text, referenceCodes: reference?.codes,
+            referenceLength: reference?.length ?? 0, referenceText: referenceText,
+            params: params, onFrame: onFrame)
+    }
+
+    /// Generation from PRE-ENCODED reference codes (see `encodeReference`).
+    public func generate(
+        text: String,
+        referenceCodes: MLXArray?,
+        referenceLength: Int,
+        referenceText: String? = nil,
+        params: SamplingParams = SamplingParams(),
+        onFrame: ((Int) throws -> Void)? = nil
     ) async throws -> Audio8GenerationResult {
         let start = Date()
-        let hasReference = referenceAudio != nil
         let (prefix, suffix) = try await promptSegments(
-            text: text, referenceText: referenceText, hasReference: hasReference)
+            text: text, referenceText: referenceText, hasReference: referenceCodes != nil)
 
-        var referenceCodes: MLXArray? = nil
-        var referenceLength = 0
-        if let audio = referenceAudio {
-            let (codes, length) = codec.encode(audio.expandedDimensions(axis: 0), sampleCount: audio.shape[0])
-            eval(codes)
-            referenceCodes = codes[0]
-            referenceLength = length
-        }
-
-        let codes = lm.generateCodes(
+        let codes = try lm.generateCodes(
             prefix: prefix, suffix: suffix,
             referenceCodes: referenceCodes, referenceLength: referenceLength,
             params: params, onFrame: onFrame)

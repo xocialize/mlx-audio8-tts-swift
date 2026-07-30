@@ -153,12 +153,16 @@ extension ArkttsModel {
     // MARK: generation loop
 
     /// Returns generated codec codes (1, numCodebooks, frames), −1-free (truncated at EOS).
+    ///
+    /// `onFrame` is invoked after each emitted frame and may throw to abort the rollout — the
+    /// error propagates unchanged, which is what lets an engine wrapper distinguish a user
+    /// cancellation from a governor preemption (CAN contract).
     public func generateCodes(
         prefix: [Int32], suffix: [Int32],
         referenceCodes: MLXArray? = nil, referenceLength: Int = 0,
         params: SamplingParams = SamplingParams(),
-        onFrame: ((Int) -> Bool)? = nil
-    ) -> MLXArray {
+        onFrame: ((Int) throws -> Void)? = nil
+    ) throws -> MLXArray {
         let (prompt, promptMask) = preparePrompt(
             prefix: prefix, suffix: suffix,
             referenceCodes: referenceCodes, referenceLength: referenceLength)
@@ -195,9 +199,7 @@ extension ArkttsModel {
             } else {
                 previous = concatenated([previous![0..., 1...], semantic[0..., .newAxis]], axis: 1)
             }
-            if let onFrame, !onFrame(frames.count) {
-                break
-            }
+            try onFrame?(frames.count)
 
             let nextColumn = concatenated([semantic[0..., .newAxis], codebooks], axis: 1)[.ellipsis, .newAxis]
             mask = concatenated([mask, MLXArray.ones([1, 1], dtype: .int32)], axis: 1)
