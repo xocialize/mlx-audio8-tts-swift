@@ -107,6 +107,7 @@ reference (45 tensors).
 | `--s2` | end-to-end vs the oracle | codec encode **100% code-exact**; greedy **102/102 frames token-exact**; waveform 4.6e-6 |
 | `--s2b` | tokenizer + one real GPU generation | prompt ids exact; 127 frames @ −18.5 dBFS |
 | `--validate` | the engine path + measured footprint | RTF 0.96, −18.8 dBFS, footprint table |
+| `--cancel` | live MID-RUN cancellation (the offline gate only covers the entry checkpoint) | unwrapped `CancellationError` 30 ms after cancel |
 
 Offline conformance (manifest, MAT-1..5, CAN-1..3, C14/INF) runs in `swift test` — 15 tests.
 

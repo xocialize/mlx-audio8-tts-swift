@@ -51,6 +51,19 @@ the resident floor when admitting, so declaring the absolute peak would double-c
    the same shape Gepard had before its streaming decode landed, and it is the obvious target for
    a future windowed-decode optimization (which would also unlock `StreamEmitting`).
 
+### Live cancellation (`--cancel`)
+
+The offline CAN gate cancels *before* `run()` starts, so it only exercises the entry checkpoint.
+This probe lets a 600-frame generation get underway, cancels at t=1.500 s, and measures:
+
+| | |
+|---|---|
+| error surfaced | `CancellationError`, **unwrapped** (never a package error type) |
+| stopped at | **1.53 s** — ~30 ms after the cancel, roughly one frame of compute |
+
+That 30 ms is the evidence the **per-frame** checkpoint fires; an uncancelled run of the same
+request takes >20 s. Without this, "CAN-1..3 green" would only mean the entry checkpoint works.
+
 ### Not yet measured
 
 - Quantized (int8/int4) LM tier — no quantized variant published yet.

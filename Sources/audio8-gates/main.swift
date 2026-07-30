@@ -316,9 +316,10 @@ func gateValidate() async throws {
     }
     let rms = (decoded.reduce(Float(0)) { $0 + $1 * $1 } / Float(max(decoded.count, 1))).squareRoot()
     let dbfs = 20 * log10(rms + 1e-12)
-    let duration = Double(decoded.count) / Double(tts.audio.sampleRate ?? 44100)
+    let sampleRate = tts.audio.sampleRate ?? ArkttsCodec.sampleRate
+    let duration = Double(decoded.count) / Double(sampleRate)
 
-    print("  ok   response: .\(tts.audio.format) \(tts.audio.sampleRate) Hz "
+    print("  ok   response: .\(tts.audio.format) \(sampleRate) Hz "
           + "\(channels)ch, \(decoded.count) samples")
     print(String(format: "  %@ audio level %.1f dBFS over %.2fs",
                  dbfs > -60 ? "ok  " : "FAIL", dbfs, duration))
@@ -381,6 +382,63 @@ func gateValidate() async throws {
     finish("VALIDATE")
 }
 
+// MARK: - CAN live: the MID-RUN checkpoint (the offline gate only proves the entry one)
+
+/// The offline `CancellationConformance.checkRun` cancels BEFORE `run()` starts, so it exercises
+/// the entry checkpoint only. This probe lets a real generation get underway, cancels it in
+/// flight, and asserts (a) it stops promptly rather than running to completion, and (b) the error
+/// surfaced is a `CancellationError` — unwrapped — so the engine can classify it.
+func gateCancel() async throws {
+    let goldens = loadGoldens()
+    let refText = "You know, I was thinking about what you said earlier, and honestly, I think you might be right about the whole thing."
+    let refSamples: [Float] = goldens["ref_audio_44100"]!.asArray(Float.self)
+    let refWavURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("audio8-cancel-ref.wav")
+    try writeWav(refSamples, to: refWavURL)
+    let refAudio = Audio(format: .wav, data: try Data(contentsOf: refWavURL),
+                         sampleRate: 44100, channels: 1)
+
+    let package = Audio8Package(configuration: Audio8Configuration(modelDirectory: modelDir))
+    try await package.load()
+
+    // A long request, so an uncancelled run would take many seconds.
+    let request = TTSRequest(
+        text: "This is a deliberately long utterance used to prove that cancellation interrupts "
+            + "the autoregressive rollout mid-flight rather than only at the entry checkpoint, "
+            + "which is all the offline conformance gate can demonstrate on its own.",
+        voice: VoiceSelector(.referenceAudio(refAudio)),
+        referenceTranscript: refText,
+        metaData: ["seed": .int(7), "maxFrames": .int(600)])
+
+    let start = Date()
+    let task = Task { @InferenceActor in try await package.run(request) }
+    // Let the rollout actually start, then cancel.
+    try await Task.sleep(for: .milliseconds(1500))
+    task.cancel()
+    let outcome = await task.result
+    let elapsed = Date().timeIntervalSince(start)
+
+    switch outcome {
+    case .failure(is CancellationError):
+        print(String(format: "  ok   mid-run cancel surfaced CancellationError after %.2fs", elapsed))
+        // An uncancelled 600-frame run is ~25 s of audio and >20 s of compute; stopping in a
+        // few seconds is the evidence the per-frame checkpoint fired.
+        if elapsed > 10 {
+            failures.append(String(format: "cancel took %.1fs — checkpoint cadence too coarse", elapsed))
+        } else {
+            print(String(format: "  ok   stopped promptly (%.2fs ≪ full-run time)", elapsed))
+        }
+    case .failure(let error):
+        failures.append("cancel surfaced \(type(of: error)) — must be an unwrapped CancellationError")
+        print("  FAIL cancel surfaced \(type(of: error)): \(error)")
+    case .success:
+        failures.append("run completed despite cancellation — no mid-run checkpoint")
+        print("  FAIL run ran to completion despite cancellation")
+    }
+    await package.unload()
+    finish("CANCEL")
+}
+
 // MARK: entry
 
 let mode = CommandLine.arguments.dropFirst().first ?? "--s1"
@@ -389,11 +447,15 @@ switch mode {
 case "--s0": try gateS0()
 case "--s1": try gateS1()
 case "--s2": try gateS2()
-case "--s2b", "--validate":
+case "--s2b", "--validate", "--cancel":
     let semaphore = DispatchSemaphore(value: 0)
     Task {
         do {
-            if mode == "--s2b" { try await gateS2b() } else { try await gateValidate() }
+            switch mode {
+            case "--s2b": try await gateS2b()
+            case "--cancel": try await gateCancel()
+            default: try await gateValidate()
+            }
         } catch {
             stderrPrint("\(mode) error: \(error)")
             exit(1)
@@ -402,6 +464,6 @@ case "--s2b", "--validate":
     }
     semaphore.wait()
 default:
-    stderrPrint("unknown mode \(mode); use --s0 | --s1 | --s2 | --s2b | --validate")
+    stderrPrint("unknown mode \(mode); use --s0 | --s1 | --s2 | --s2b | --validate | --cancel")
     exit(2)
 }
