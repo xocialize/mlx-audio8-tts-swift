@@ -41,6 +41,17 @@ let package = Package(
         // Qwen byte-level BPE (tokenizer.json) for the prompt builder.
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
         .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.40.1"),
+        // Falcon-H1 hybrid slow stack for the 0.1b checkpoint (slow_backbone: falcon_h1).
+        // Same dependency mlx-gepard-swift already carries in this area.
+        //
+        // TEMPORARY: pinned to the fork branch carrying ml-explore/mlx-swift-lm#596, which
+        // exposes the encoder surface this package needs (arktts feeds the slow stack a
+        // COMPOSITE embedding, so it can never go through the token-id entry point).
+        // Flip to `.package(url: "https://github.com/ml-explore/mlx-swift-lm", from: ...)`
+        // once that PR merges — nothing else has to change.
+        .package(
+            url: "https://github.com/xocialize/mlx-swift-lm",
+            branch: "falcon-h1-encoder-spi"),
     ],
     targets: [
         .target(
@@ -51,6 +62,8 @@ let package = Package(
                 .product(name: "MLXFast", package: "mlx-swift"),
                 .product(name: "MLXRandom", package: "mlx-swift"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
             ],
             path: "Sources/Audio8TTSCore",
             swiftSettings: [.swiftLanguageMode(.v5)]

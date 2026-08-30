@@ -3,6 +3,7 @@
 // generation loop, ported 1:1 from the parity-locked Python-MLX reference.
 
 import Foundation
+@_spi(FalconH1Encoder) import MLXLLM
 import MLX
 import MLXRandom
 
@@ -43,6 +44,13 @@ extension ArkttsModel {
     }
 
     func semanticFilter(_ scores: MLXArray) -> MLXArray {
+        if config.usesFalconSlow {
+            // Compact head: the reference builds this filter with
+            // (begin, end, eos) = (0, codebookSize - 1, codebookSize), spanning all
+            // codebookSize + 1 columns. Provably a no-op, so skip the full-width scatter
+            // rather than pay for it every frame.
+            return scores
+        }
         var filtered = MLXArray.full(scores.shape, values: MLXArray(-Float.infinity))
             .asType(scores.dtype)
         filtered[0..., config.semanticBeginId...config.semanticEndId] =
@@ -86,8 +94,12 @@ extension ArkttsModel {
             key: keys.1)
         guard let previous else { return normal }
         let repeated = (previous .== normal[0..., .newAxis]).any(axis: 1)
-        let semantic = (normal .>= Int32(config.semanticBeginId))
-            .&& (normal .<= Int32(config.semanticEndId))
+        // Compact space: semantic ids are 0..codebookSize-1 and EOS is codebookSize.
+        let semantic =
+            config.usesFalconSlow
+            ? (normal .< Int32(config.codebookSize))
+            : (normal .>= Int32(config.semanticBeginId))
+                .&& (normal .<= Int32(config.semanticEndId))
         return which(repeated .&& semantic, high, normal)
     }
 
@@ -96,8 +108,11 @@ extension ArkttsModel {
     ) -> MLXArray {
         // fast_project_in is Identity for this config
         _ = fastStep(slowHidden, position: 0)
-        var current = clip(
-            semantic - Int32(config.semanticBeginId), min: 0, max: Int32(config.codebookSize - 1))
+        // Codebook 0 IS the semantic token in codebook space. The compact head already emits
+        // that space; the full-vocabulary head needs the offset removed.
+        let rawSemantic =
+            config.usesFalconSlow ? semantic : semantic - Int32(config.semanticBeginId)
+        var current = clip(rawSemantic, min: 0, max: Int32(config.codebookSize - 1))
         var codebooks = [current]
         var hidden = fastEmbeddings(current).expandedDimensions(axis: 1)
         var key = keyIn
@@ -170,7 +185,7 @@ extension ArkttsModel {
         let promptWidth = prompt.shape[2]
         precondition(promptWidth < config.maxSeqLen, "prompt length \(promptWidth) >= max_seq_len")
         let maxNewTokens = min(params.maxNewTokens, config.maxSeqLen - promptWidth)
-        let dtype = embeddings.weight.dtype
+        let dtype = (embeddings?.weight ?? slow!.embedTokens.weight).dtype
         setupGenerationCaches(batch: 1, dtype: dtype)
         defer { clearGenerationCaches() }
 
@@ -191,7 +206,10 @@ extension ArkttsModel {
             let codebooks = generateCodebooks(
                 slowHidden: slowHidden, semantic: semantic, params: params, key: keys[2])
             eval(semantic, codebooks)
-            if semantic.item(Int32.self) == Int32(config.eosTokenId) {
+            // In the compact semantic space EOS is the last column of the head, not the
+            // tokenizer's eos_token_id.
+            let eosIndex = config.usesFalconSlow ? config.codebookSize : config.eosTokenId
+            if semantic.item(Int32.self) == Int32(eosIndex) {
                 break
             }
             frames.append(codebooks)
@@ -206,7 +224,12 @@ extension ArkttsModel {
             // exists, which is most of the wall clock.
             try onFrameCodes?(codebooks)
 
-            let nextColumn = concatenated([semantic[0..., .newAxis], codebooks], axis: 1)[.ellipsis, .newAxis]
+            // The slow stack is always fed FULL-vocabulary ids, even when the head emits the
+            // compact space, because the prompt rows are full-vocabulary. (EOS is handled by
+            // the break above, so only the semantic branch can be reached here.)
+            let semanticIn =
+                config.usesFalconSlow ? semantic + Int32(config.semanticBeginId) : semantic
+            let nextColumn = concatenated([semanticIn[0..., .newAxis], codebooks], axis: 1)[.ellipsis, .newAxis]
             mask = concatenated([mask, MLXArray.ones([1, 1], dtype: .int32)], axis: 1)
             let physical = promptWidth + step
             let tokenPosition = MLXArray([Int32(promptWidth + step)]).expandedDimensions(axis: 0)

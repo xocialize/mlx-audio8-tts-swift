@@ -11,6 +11,8 @@
 // weight multiplies AFTER downcast; KV cache is a full max_seq_len buffer with bool masks.
 
 import Foundation
+@_spi(FalconH1Encoder) import MLXLLM
+import MLXLMCommon
 import MLX
 import MLXFast
 import MLXNN
@@ -55,6 +57,31 @@ public struct ArkttsConfig: Codable, Sendable {
     public var eosTokenId: Int
     public var padTokenId: Int
 
+    // MARK: slow-backbone selection (0.1b)
+
+    /// `"arktts"` (default, 0.6b: pure-attention slow stack) or `"falcon_h1"` (0.1b:
+    /// Mamba-2 + attention hybrid). Optional so 0.6b configs, which carry neither this key
+    /// nor any of the Falcon ones, keep decoding unchanged.
+    public var slowBackbone: String?
+
+    /// Scales the slow stack's input embedding on the `falcon_h1` path.
+    ///
+    /// - Important: this applies to the COMPOSITE embedding — text plus the ten codebook
+    ///   embeddings — not to the token lookup alone. The published `mlx-community` weights
+    ///   therefore ship a RAW `embed_tokens` table, unlike a plain Falcon-H1 conversion
+    ///   where `sanitize()` folds the multiplier into it. Folding it here and adding the
+    ///   codebook sum unscaled measures 77% relative error on the embedding and 38% on the
+    ///   final hidden state — while still producing plausible audio of the right length.
+    public var embeddingMultiplier: Float?
+
+    public var usesFalconSlow: Bool { slowBackbone == "falcon_h1" }
+
+    /// Decoded from the same config.json when ``usesFalconSlow``. The reference config
+    /// duplicates every field under both the arktts and the Falcon naming conventions
+    /// (`dim`/`hidden_size`, `n_layer`/`num_hidden_layers`, …) precisely so the Falcon
+    /// configuration can be built from it directly. Not a coding key — set by ``load(from:)``.
+    public var falconConfiguration: FalconH1Configuration? = nil
+
     enum CodingKeys: String, CodingKey {
         case vocabSize = "vocab_size"
         case dim
@@ -94,10 +121,18 @@ public struct ArkttsConfig: Codable, Sendable {
         case rasTopP = "ras_top_p"
         case eosTokenId = "eos_token_id"
         case padTokenId = "pad_token_id"
+        case slowBackbone = "slow_backbone"
+        case embeddingMultiplier = "embedding_multiplier"
     }
 
     public static func load(from url: URL) throws -> ArkttsConfig {
-        try JSONDecoder().decode(ArkttsConfig.self, from: Data(contentsOf: url))
+        let data = try Data(contentsOf: url)
+        var config = try JSONDecoder().decode(ArkttsConfig.self, from: data)
+        if config.usesFalconSlow {
+            config.falconConfiguration = try JSONDecoder().decode(
+                FalconH1Configuration.self, from: data)
+        }
+        return config
     }
 }
 
@@ -270,32 +305,58 @@ public final class ArkttsTransformerBlock: Module {
 
 public final class ArkttsModel: Module {
     public let config: ArkttsConfig
-    @ModuleInfo(key: "embeddings") public var embeddings: Embedding
+    // The 0.6b (`slow_backbone: arktts`) slow stack. nil on the falcon_h1 path, so its
+    // keys are absent from `parameters()` and the strict key contract in Audio8TTS.load
+    // stays exact for both checkpoints.
+    @ModuleInfo(key: "embeddings") public var embeddings: Embedding?
+    @ModuleInfo(key: "layers") public var layers: [ArkttsTransformerBlock]?
+    @ModuleInfo(key: "norm") public var norm: ArkttsRMSNorm?
+
+    // The 0.1b (`slow_backbone: falcon_h1`) slow stack, and its compact semantic head.
+    // nil on the arktts path, for the same reason.
+    @ModuleInfo(key: "slow") public var slow: FalconH1ModelInner?
+    @ModuleInfo(key: "semantic_output") public var semanticOutput: Linear?
+
     @ModuleInfo(key: "codebook_embeddings") public var codebookEmbeddings: Embedding
-    @ModuleInfo(key: "layers") public var layers: [ArkttsTransformerBlock]
-    @ModuleInfo(key: "norm") public var norm: ArkttsRMSNorm
     @ModuleInfo(key: "fast_embeddings") public var fastEmbeddings: Embedding
     @ModuleInfo(key: "fast_layers") public var fastLayers: [ArkttsTransformerBlock]
     @ModuleInfo(key: "fast_norm") public var fastNorm: ArkttsRMSNorm
     @ModuleInfo(key: "fast_output") public var fastOutput: Linear
 
-    public let freqsCis: RopeTable
+    public let freqsCis: RopeTable?
+
+    /// Falcon hybrid slow cache, alive only between setupGenerationCaches and
+    /// clearGenerationCaches. Not a Module, so it never reaches `parameters()`.
+    private var slowCache: [CacheList]?
     public let fastFreqsCis: RopeTable
 
     public init(config: ArkttsConfig) {
         self.config = config
         precondition(config.fastDim == config.dim, "fast_project_in != Identity is not supported")
-        self._embeddings.wrappedValue = Embedding(embeddingCount: config.vocabSize, dimensions: config.dim)
         self._codebookEmbeddings.wrappedValue = Embedding(
             embeddingCount: config.codebookSize * config.numCodebooks, dimensions: config.dim)
-        self._layers.wrappedValue = (0..<config.nLayer).map { _ in
-            ArkttsTransformerBlock(
-                dim: config.dim, intermediateSize: config.intermediateSize,
-                nHead: config.nHead, nLocalHeads: config.nLocalHeads, headDim: config.headDim,
-                qkvBias: config.attentionQkvBias, outputBias: config.attentionOBias,
-                normEps: config.normEps)
+        if config.usesFalconSlow {
+            guard let falcon = config.falconConfiguration else {
+                preconditionFailure("slow_backbone=falcon_h1 requires a decodable Falcon config")
+            }
+            // FalconH1ModelInner, not FalconH1Model: the wrapper would add an lm_head
+            // (tie_word_embeddings decodes false by default) that this checkpoint does not
+            // carry and this model does not want — arktts brings its own semantic head.
+            self._slow.wrappedValue = FalconH1ModelInner(falcon)
+            self._semanticOutput.wrappedValue = Linear(
+                config.dim, config.codebookSize + 1, bias: false)
+        } else {
+            self._embeddings.wrappedValue = Embedding(
+                embeddingCount: config.vocabSize, dimensions: config.dim)
+            self._layers.wrappedValue = (0..<config.nLayer).map { _ in
+                ArkttsTransformerBlock(
+                    dim: config.dim, intermediateSize: config.intermediateSize,
+                    nHead: config.nHead, nLocalHeads: config.nLocalHeads, headDim: config.headDim,
+                    qkvBias: config.attentionQkvBias, outputBias: config.attentionOBias,
+                    normEps: config.normEps)
+            }
+            self._norm.wrappedValue = ArkttsRMSNorm(dim: config.dim, eps: config.normEps)
         }
-        self._norm.wrappedValue = ArkttsRMSNorm(dim: config.dim, eps: config.normEps)
         self._fastEmbeddings.wrappedValue = Embedding(
             embeddingCount: config.codebookSize, dimensions: config.fastDim)
         self._fastLayers.wrappedValue = (0..<config.nFastLayer).map { _ in
@@ -308,7 +369,11 @@ public final class ArkttsModel: Module {
         }
         self._fastNorm.wrappedValue = ArkttsRMSNorm(dim: config.fastDim, eps: config.normEps)
         self._fastOutput.wrappedValue = Linear(config.fastDim, config.codebookSize, bias: false)
-        self.freqsCis = RopeTable(length: config.maxSeqLen, headDim: config.headDim, base: config.ropeBase)
+        // The Falcon stack builds its own rope internally; only the arktts path needs this.
+        self.freqsCis =
+            config.usesFalconSlow
+            ? nil
+            : RopeTable(length: config.maxSeqLen, headDim: config.headDim, base: config.ropeBase)
         self.fastFreqsCis = RopeTable(
             length: config.numCodebooks, headDim: config.fastHeadDim, base: config.ropeBase)
     }
@@ -327,7 +392,22 @@ public final class ArkttsModel: Module {
         let semantic = (semanticRow .>= Int32(config.semanticBeginId))
             .&& (semanticRow .<= Int32(config.semanticEndId))
         codebookSum = which(semantic[.ellipsis, .newAxis], codebookSum, MLXArray(Float(0)))
-        return embeddings(semanticRow) + codebookSum
+        // Returned UNSCALED on the falcon path: `slowForward` applies embeddingMultiplier
+        // to this composite. See ArkttsConfig.embeddingMultiplier for why that must not be
+        // folded into the lookup table instead.
+        return textEmbeddings(semanticRow) + codebookSum
+    }
+
+    /// The text-token embedding table, wherever this variant keeps it.
+    public func textEmbeddings(_ ids: MLXArray) -> MLXArray {
+        if let slow { return slow.embedTokens(ids) }
+        return embeddings!(ids)
+    }
+
+    /// Falcon slow stack over the composite embedding, with the multiplier applied here.
+    private func slowForward(_ hidden: MLXArray, cache: [CacheList]?) -> MLXArray {
+        let multiplier = config.embeddingMultiplier ?? 1.0
+        return slow!(inputsEmbeds: hidden * multiplier, cache: cache)
     }
 
     static func causalMask(
@@ -351,26 +431,39 @@ public final class ArkttsModel: Module {
     ) -> (MLXArray, MLXArray) {
         let (batch, length) = (inputIds.shape[0], inputIds.shape[2])
         let mask2d = attentionMask ?? MLXArray.ones([batch, length], dtype: .int32)
+        var hidden = embed(inputIds)
+        if config.usesFalconSlow {
+            let normalized = slowForward(hidden, cache: nil)
+            return (semanticOutput!(normalized), normalized)
+        }
         let positionIds = maximum(cumsum(mask2d.asType(.int32), axis: -1) - 1, 0)
-        let rope = freqsCis.values[positionIds]
+        let rope = freqsCis!.values[positionIds]
         let mask = Self.causalMask(
             attentionMask: mask2d, queryPositions: MLXArray(0..<Int32(length)), keyLength: length)
-        var hidden = embed(inputIds)
-        for layer in layers {
+        for layer in layers! {
             hidden = layer(hidden, rope: rope, mask: mask)
         }
-        let normalized = norm(hidden)
-        let logits = matmul(normalized, embeddings.weight.T)
+        let normalized = norm!(hidden)
+        let logits = matmul(normalized, embeddings!.weight.T)
         return (logits, hidden)
     }
 
     // MARK: cached decode
 
     public func setupGenerationCaches(batch: Int, dtype: DType) {
-        for layer in layers {
-            layer.attention.kvCache = ArkttsKVCache(
-                batch: batch, maxLength: config.maxSeqLen,
-                heads: config.nLocalHeads, headDim: config.headDim, dtype: dtype)
+        if let slow {
+            // Hybrid cache: per layer an ArraysCache(2) for the Mamba conv+ssm state and a
+            // KVCache for the attention half. Unlike the arktts path's static full-buffer
+            // cache, this tracks its own offset, so slowStep feeds only the new column.
+            slowCache = (0..<slow.layers.count).map { _ in
+                CacheList(MambaCache(), KVCacheSimple())
+            }
+        } else {
+            for layer in layers! {
+                layer.attention.kvCache = ArkttsKVCache(
+                    batch: batch, maxLength: config.maxSeqLen,
+                    heads: config.nLocalHeads, headDim: config.headDim, dtype: dtype)
+            }
         }
         for layer in fastLayers {
             layer.attention.kvCache = ArkttsKVCache(
@@ -380,7 +473,8 @@ public final class ArkttsModel: Module {
     }
 
     public func clearGenerationCaches() {
-        for layer in layers { layer.attention.kvCache = nil }
+        slowCache = nil
+        for layer in layers ?? [] { layer.attention.kvCache = nil }
         for layer in fastLayers { layer.attention.kvCache = nil }
     }
 
@@ -390,15 +484,24 @@ public final class ArkttsModel: Module {
         positionIds: MLXArray, attentionMask: MLXArray
     ) -> (MLXArray, MLXArray) {
         var hidden = embed(inputIds)
-        let rope = freqsCis.values[positionIds]
+        if config.usesFalconSlow {
+            // The hybrid cache carries its own offset and mask construction, so the explicit
+            // position/mask arguments are unused here. The reference returns the normalized
+            // hidden for BOTH the logits and the fast-AR input on this path —
+            // norm_fastlayer_input is not consulted.
+            let normalized = slowForward(hidden, cache: slowCache)
+            let last = normalized[0..., (normalized.shape[1] - 1)...]
+            return (semanticOutput!(last)[0..., -1], last)
+        }
+        let rope = freqsCis!.values[positionIds]
         let mask = Self.causalMask(
             attentionMask: attentionMask, queryPositions: cachePositions, keyLength: config.maxSeqLen)
-        for layer in layers {
+        for layer in layers! {
             hidden = layer(hidden, rope: rope, mask: mask, cacheStart: cacheStart)
         }
         hidden = hidden[0..., (hidden.shape[1] - 1)...]
-        let normalized = norm(hidden)
-        let logits = matmul(normalized, embeddings.weight.T)[0..., -1]
+        let normalized = norm!(hidden)
+        let logits = matmul(normalized, embeddings!.weight.T)[0..., -1]
         let fastHidden = config.normFastlayerInput ? normalized : hidden
         return (logits, fastHidden)
     }

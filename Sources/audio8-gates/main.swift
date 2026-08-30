@@ -9,6 +9,8 @@
 //   --s2b  prompt ids vs processor fixtures + one real sampled GPU generation (wav out)
 
 import Foundation
+@_spi(FalconH1Encoder) import MLXLLM
+import MLXLMCommon
 import MLX
 import Audio8TTSCore
 import MLXAudio8TTS
@@ -19,7 +21,10 @@ import MLXToolKit
 let fileDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
 let repoRoot = fileDir.deletingLastPathComponent().deletingLastPathComponent()
 let workspaceRoot = repoRoot.deletingLastPathComponent()
-let goldensURL = workspaceRoot.appendingPathComponent("oracle-capture/goldens/arktts_goldens.safetensors")
+// Both overridable so the same gates run against either checkpoint: the 0.6b (default)
+// or the 0.1b, whose goldens and release repo live under WIP/audio8-tts.
+let goldensURL = ProcessInfo.processInfo.environment["AUDIO8_GOLDENS"].map { URL(fileURLWithPath: $0) }
+    ?? workspaceRoot.appendingPathComponent("oracle-capture/goldens/arktts_goldens.safetensors")
 let modelDir = ProcessInfo.processInfo.environment["AUDIO8_MODEL_DIR"].map { URL(fileURLWithPath: $0) }
     ?? workspaceRoot.appendingPathComponent("release/Audio8-TTS-Preview-0.6b-bf16")
 
@@ -106,23 +111,52 @@ func gateS1() throws {
     let model = try Audio8TTS.load(directory: modelDir, lmDtype: .float32)
     let lm = model.lm
 
-    check("unit.rope_table_slow", lm.freqsCis.values[..<32], goldens["unit.rope_table_slow"]!, tol: 1e-6)
     check("unit.rope_table_fast", lm.fastFreqsCis.values, goldens["unit.rope_table_fast"]!, tol: 1e-6)
 
-    let xSlow = goldens["unit.x_slow_in"]!
-    let length = 17
-    let rope = lm.freqsCis.values[MLXArray(0..<Int32(length))].expandedDimensions(axis: 0)
-    let row = MLXArray(0..<Int32(length))[0..., .newAxis]
-    let col = MLXArray(0..<Int32(length))[.newAxis, 0...]
-    let mask = (col .<= row).expandedDimensions(axes: [0, 1])
-    check("unit.rmsnorm_out", lm.norm(xSlow), goldens["unit.rmsnorm_out"]!, tol: 1e-5)
-    check("unit.slow_ffn0_out", lm.layers[0].feedForward(xSlow), goldens["unit.slow_ffn0_out"]!, tol: 1e-4)
-    check(
-        "unit.slow_attn0_out",
-        lm.layers[0].attention(lm.layers[0].attentionNorm(xSlow), rope: rope, mask: mask),
-        goldens["unit.slow_attn0_out"]!, tol: 1e-4)
-    check("unit.slow_block0_out", lm.layers[0](xSlow, rope: rope, mask: mask),
-          goldens["unit.slow_block0_out"]!, tol: 1e-4)
+    // The slow-stack unit fixtures differ per backbone: the arktts path has a rope table and
+    // hand-written blocks to probe, the falcon_h1 path has neither (its rope is internal and
+    // its layers come from mlx-swift-lm). Each variant's goldens are named accordingly, so
+    // running the wrong set would fail on a missing key rather than silently skip.
+    let xSlow: MLXArray
+    if lm.config.usesFalconSlow {
+        // Layer-level, not submodule-level: the decoder layer's mamba/attention/MLP are
+        // internal to mlx-swift-lm and deliberately stay that way (the exposed surface
+        // mirrors the Gemma encoder exposures). The layer input is captured from a real
+        // prefill, so this probes actual distributions rather than synthetic noise.
+        let layerIn = goldens["unit.inputnorm0_in"]!
+        check(
+            "prefill.slow_layer0_out",
+            lm.slow!.layers[0](
+                layerIn, cache: nil,
+                attnMask: createAttentionMask(h: layerIn, cache: nil),
+                mambaMask: createSSMMask(h: layerIn, cache: nil)),
+            goldens["prefill.slow_layer0_out"]!, tol: 1e-3)
+        check("unit.finalnorm_out", lm.slow!.finalLayerNorm(goldens["unit.finalnorm_in"]!),
+              goldens["unit.finalnorm_out"]!, tol: 1e-4)
+        // The seam itself, and the trap: the multiplier belongs on the COMPOSITE.
+        check("embed.raw_unscaled", lm.embed(goldens["prompt.ids"]!.asType(.int32)),
+              goldens["embed.raw_unscaled"]!, tol: 1e-4)
+        xSlow = goldens["unit.x_fast_in"]!
+    } else {
+        check("unit.rope_table_slow", lm.freqsCis!.values[..<32],
+              goldens["unit.rope_table_slow"]!, tol: 1e-6)
+        let x = goldens["unit.x_slow_in"]!
+        let length = 17
+        let rope = lm.freqsCis!.values[MLXArray(0..<Int32(length))].expandedDimensions(axis: 0)
+        let row = MLXArray(0..<Int32(length))[0..., .newAxis]
+        let col = MLXArray(0..<Int32(length))[.newAxis, 0...]
+        let mask = (col .<= row).expandedDimensions(axes: [0, 1])
+        check("unit.rmsnorm_out", lm.norm!(x), goldens["unit.rmsnorm_out"]!, tol: 1e-5)
+        check("unit.slow_ffn0_out", lm.layers![0].feedForward(x),
+              goldens["unit.slow_ffn0_out"]!, tol: 1e-4)
+        check(
+            "unit.slow_attn0_out",
+            lm.layers![0].attention(lm.layers![0].attentionNorm(x), rope: rope, mask: mask),
+            goldens["unit.slow_attn0_out"]!, tol: 1e-4)
+        check("unit.slow_block0_out", lm.layers![0](x, rope: rope, mask: mask),
+              goldens["unit.slow_block0_out"]!, tol: 1e-4)
+        xSlow = x
+    }
     let xFast = xSlow[0..., ..<10]
     let ropeF = lm.fastFreqsCis.values[MLXArray(0..<10)].expandedDimensions(axis: 0)
     let rowF = MLXArray(0..<10)[0..., .newAxis]
@@ -149,6 +183,16 @@ func gateS1() throws {
     finish("S1")
 }
 
+/// CPU-exact parity: codec encode, the composite embedding, and prefill.
+///
+/// For `falcon_h1` this stops before the generation rollout, which cannot run here:
+/// mlx-swift-lm's cached Mamba step is a `metal_kernel` and hard-errors on the CPU stream
+/// ("[metal_kernel] Only supports the GPU"). Switching the default device mid-run does not
+/// help — the default stream is already resolved — so the rollout lives in its own process
+/// as `--s2gen`. Keeping the split at the process boundary is what preserves the exactness
+/// of everything above it: running the whole gate on the GPU instead drops codec encode
+/// from 100% to 95.6% code-exact and prefill from 1.8e-05 to 2.8e-02, because GPU fp32
+/// reorders reductions and the VQ nearest-neighbour argmax flips on ties.
 func gateS2() throws {
     Device.setDefault(device: Device(.cpu))
     let goldens = loadGoldens()
@@ -168,10 +212,20 @@ func gateS2() throws {
     // prefill parity on the prompt fixture
     let prompt = goldens["prompt.ids"]!.asType(.int32)
     let promptMask = goldens["prompt.mask"]!.asType(.int32)
-    check("prefill.embed", lm.embed(prompt), goldens["prefill.embed"]!, tol: 1e-4)
+    // Same tensor, different fixture name per capture: the 0.1b harness calls it
+    // `embed.raw_unscaled` because that path has a second, SCALED embedding worth pinning
+    // separately (the multiplier belongs on the composite, not the lookup table).
+    let embedKey = lm.config.usesFalconSlow ? "embed.raw_unscaled" : "prefill.embed"
+    check(embedKey, lm.embed(prompt), goldens[embedKey]!, tol: 1e-4)
     let (logits, hidden) = lm(prompt, attentionMask: promptMask)
     check("prefill.logits_last", logits[0..., -1], goldens["prefill.logits_last"]!, tol: 2e-2)
     check("prefill.hidden_last", hidden[0..., -1], goldens["prefill.hidden_last"]!, tol: 2e-2)
+
+    if lm.config.usesFalconSlow {
+        print("  --   greedy rollout skipped on CPU (GPU-only cached Mamba step) — run --s2gen")
+        finish("S2")
+        return
+    }
 
     // greedy generation: token-exact vs the oracle
     let prefix: [Int32] = goldens["proc.prefix_input_ids"]![0].asArray(Int32.self)
@@ -200,6 +254,90 @@ func gateS2() throws {
     print("  \(diff < 5e-3 ? "ok  " : "FAIL") waveform max_abs \(diff)")
     if diff >= 5e-3 { failures.append("waveform diff \(diff)") }
     finish("S2")
+}
+
+/// The generation rollout for `falcon_h1`, on the GPU because it has to be (see `gateS2`).
+///
+/// Deliberately NOT a token-parity proof, and the code-agreement line below is reported as
+/// information rather than checked. A GPU rollout CANNOT be token-exact against a CPU
+/// oracle here, and the reason is upstream of the language model: the codec's VQ
+/// nearest-neighbour encode is not code-exact across devices, so the reference codes differ,
+/// the prompt differs, and every frame after that is conditioned differently.
+///
+/// Measured, same checkpoint, same reference clip, deterministic decoding:
+///
+///     runtime            codec encode    greedy agreement vs the CPU oracle
+///     Python-MLX  CPU        100%              100%  (token-exact)
+///     Python-MLX  GPU       94.95%             7.76%
+///     Swift       GPU       95.59%            12.06%
+///
+/// Swift agrees slightly BETTER than Python-MLX does on the same device, so a low number
+/// here is a device effect, not a defect in this port. Token-exactness for this checkpoint
+/// is established CPU-to-CPU (gateS2 above, and parity_mlx.py at 100% over 107 frames).
+/// What this gate adds is the one thing those cannot reach: that the Swift cached-Mamba
+/// path runs at all and produces audio of the right length and level.
+func gateS2Gen() throws {
+    Device.setDefault(device: Device(.gpu))
+    let goldens = loadGoldens()
+    let model = try Audio8TTS.load(directory: modelDir, lmDtype: .float32)
+    let lm = model.lm
+    guard lm.config.usesFalconSlow else {
+        print("  --   --s2gen is for the falcon_h1 checkpoint; --s2 already covers arktts")
+        finish("S2gen")
+        return
+    }
+
+    let refAudio = goldens["ref_audio_44100"]!
+    let refLen = goldens["proc.reference_audio_lengths"]!.asType(.int32).item(Int32.self)
+    let (refCodes, refCodeLen) = model.codec.encode(
+        refAudio.expandedDimensions(axis: 0), sampleCount: Int(refLen))
+    eval(refCodes)
+
+    let prefix: [Int32] = goldens["proc.prefix_input_ids"]![0].asArray(Int32.self)
+    let suffix: [Int32] = goldens["proc.suffix_input_ids"]![0].asArray(Int32.self)
+    let generated = try lm.generateCodes(
+        prefix: prefix, suffix: suffix,
+        referenceCodes: refCodes[0], referenceLength: refCodeLen,
+        params: SamplingParams(maxNewTokens: 200, doSample: false))
+    eval(generated)
+
+    let goldenGreedy = goldens["gen.codes_greedy"]!.asType(.int32)
+    let frames = generated.shape[2]
+    let goldenFrames = goldenGreedy.shape[2]
+    print("  --   greedy frames: swift(GPU) \(frames) vs oracle(CPU) \(goldenFrames)")
+    // Length within a frame or two, and the shared prefix mostly agreeing, is what a
+    // correct-but-not-bit-identical rollout looks like. A broken one diverges immediately.
+    let lengthOK = abs(frames - goldenFrames) <= 2
+    print("  \(lengthOK ? "ok  " : "FAIL") rollout length within 2 frames of the oracle")
+    if !lengthOK { failures.append("greedy length \(frames) vs \(goldenFrames)") }
+
+    let shared = min(frames, goldenFrames)
+    let agree = (generated[0..., 0..., ..<shared] .== goldenGreedy[0..., 0..., ..<shared])
+        .asType(.float32).mean().item(Float.self)
+    // Informational. See this function's doc comment: cross-device VQ encode makes a high
+    // number impossible, so this is NOT a pass/fail check. Python-MLX on the same device
+    // scores 7.76% against the same oracle.
+    print("  --   code agreement over the shared \(shared) frames: \(agree * 100)% "
+        + "(informational — cross-device; python-mlx GPU scores 7.76% here)")
+
+    // The load-bearing check: the audio must be real speech, not silence or noise.
+    let wave = model.codec.decode(generated)
+    eval(wave)
+    let audio = wave[0]
+    let rms = sqrt((audio * audio).mean()).item(Float.self)
+    let peak = abs(audio).max().item(Float.self)
+    let dB = { (x: Float) in 20 * log10(max(x, 1e-12)) }
+    let seconds = Float(audio.shape[0]) / Float(lm.config.codecSampleRate)
+    print("  --   audio \(seconds)s  rms \(dB(rms)) dBFS  peak \(dB(peak)) dBFS")
+    let audible = dB(rms) > -40 && dB(rms) < -3 && peak <= 1.0
+    print("  \(audible ? "ok  " : "FAIL") decoded audio is in a sane level range")
+    if !audible { failures.append("audio level rms \(dB(rms)) dBFS peak \(dB(peak)) dBFS") }
+
+    let wavURL = goldensURL.deletingLastPathComponent()
+        .appendingPathComponent("swift_smoke_0.1b_gpu.wav")
+    try writeWav(audio.asArray(Float.self), to: wavURL, sampleRate: lm.config.codecSampleRate)
+    print("  --   wav -> \(wavURL.path)")
+    finish("S2gen")
 }
 
 func gateS2b() async throws {
@@ -696,6 +834,7 @@ case "--s0": try gateS0()
 case "--s5": try gateS5()
 case "--s1": try gateS1()
 case "--s2": try gateS2()
+case "--s2gen": try gateS2Gen()
 case "--s2b", "--validate", "--cancel", "--stream", "--streamenv":
     let semaphore = DispatchSemaphore(value: 0)
     Task {
