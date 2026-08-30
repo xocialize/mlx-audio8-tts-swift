@@ -306,3 +306,104 @@ the tuning knob (`streamChunkFrames`): larger chunks amortize the re-decoded con
 - Quantized (int8/int4) LM tier — no quantized variant published yet.
 - Cold-start prewarm effect on load time.
 - Sustained multi-run memory behavior under an engine `cacheLimit` cap.
+
+## 2026-08-30 — Audio8-TTS-Preview-0.1b (`Audio8MiniPackage`)
+
+Everything above measures the 0.6b. This section is the compact sibling — same harness,
+same machine, `AUDIO8_MODEL_DIR` pointed at `release/Audio8-TTS-Preview-0.1b-bf16`.
+
+### Footprint (`--validate`, through the real package lifecycle)
+
+| | 0.6b | 0.1b |
+|---|---|---|
+| resident floor (MLX-active, post-load) | 2434 MB | **1611 MB** |
+| transient (peak − resident) | 3482 MB | **3711 MB** |
+| declared `residentBytes` | 2.60 GB | **1.81 GB** |
+| declared `peakActivationBytes` | 4.20 GB | **4.40 GB** |
+| load | 0.09–0.44 s | 0.25 s |
+| RTF (9.2 s utterance) | ~1.07 | **0.46** |
+
+Two things in that table are worth not skimming.
+
+**The resident saving is much smaller than the model shrink.** The LM is 3.5x smaller
+(601M → 170M, 1.2 GB → 340 MB) but resident only drops 34%, because the codec is
+*unchanged* and is ~80% of what remains. Anyone reaching for this checkpoint to fit a
+memory budget should size against 1.6 GB, not against "a 0.17B model".
+
+**The transient is slightly HIGHER than the 0.6b's**, not lower. Same reason: the
+activation envelope is dominated by the shared codec decode, which does not know or care
+how big the language model was.
+
+### Activation envelope (`--streamenv`)
+
+    resident floor 1611 MB
+    frames   batch peak   stream peak
+        64      3457 MB      3474 MB
+       128      3457 MB      3474 MB
+       234      3458 MB      3474 MB
+
+Flat, for the same reason the 0.6b's is flat — both share the windowed decode.
+
+**Honest limit on that evidence.** The sweep requests 64/128/256/512, but this checkpoint
+reaches EOS at 234 frames on the sweep text, so the 256 and 512 rungs both measure 234 and
+the cap was never reached. Flatness here therefore rests on 64→234 measured *plus* the
+shared, length-independent mechanism the 0.6b verified out to 1035 frames — not on a
+512-frame measurement of this checkpoint. Worth stating plainly, because the 0.6b's
+declaration was revised upward three times (5.00 → 7.20 → 9.50 GB) for precisely the
+failure this note is guarding against: a sample that never reaches the cap.
+
+### Parity (fp32 CPU vs the PyTorch oracle)
+
+| | max_abs |
+|---|---|
+| composite embedding | **0.0** |
+| Falcon decoder layer 0 | 4.29e-06 |
+| final layernorm | 3.05e-05 |
+| semantic logits (compact head) | 4.01e-05 |
+| prefill hidden (24 hybrid layers) | 1.81e-05 |
+| fast block 0 | 9.54e-07 |
+| codec encode | **100% code-exact** |
+
+### The gate that could not run, and what replaced it
+
+The 0.6b's S2 proves greedy generation **token-exact** on CPU. That gate cannot exist for
+this checkpoint: `mlx-swift-lm`'s cached Mamba step is a `metal_kernel` and hard-errors on
+the CPU stream, so the rollout must run on GPU — and on GPU a token-exact comparison against
+a CPU oracle is impossible for a reason upstream of the language model. The codec's VQ
+nearest-neighbour encode is not code-exact across devices, so the reference codes differ and
+every frame after that is conditioned differently.
+
+    runtime            codec encode   greedy agreement vs the CPU oracle
+    Python-MLX  CPU       100%              100%  (token-exact)
+    Python-MLX  GPU      94.95%             7.76%
+    Swift       GPU      95.59%            12.06%
+
+This port agrees *better* than Python-MLX does on the same device, so the low number is a
+device effect rather than a defect here. Token-exactness for this checkpoint is established
+CPU-to-CPU by the Python-MLX harness (100% over 107 frames). `--s2gen` therefore checks
+rollout length and audio level and reports the agreement as information, explicitly not as a
+pass/fail — a number that cannot be high must not be wired to a gate.
+
+Two traps banked while finding this:
+
+1. Switching the default device mid-run does **not** work — the default stream is already
+   resolved, and the GPU-only op still errors on a CPU stream. Split at the *process*
+   boundary instead, which is why `--s2` and `--s2gen` are separate invocations.
+2. Running the whole gate on GPU to accommodate one GPU-only op silently degrades everything
+   above it: codec encode 100% → 95.6%, prefill 1.8e-05 → 2.8e-02.
+
+### Live gates
+
+| | |
+|---|---|
+| `--cancel` | `CancellationError` surfaced at **1.51 s**, unwrapped |
+| `--stream` | aggregate byte-identical to batch; first audio **4.24 s** ahead; batch 3458 MB / stream 3474 MB, both inside the declared 4.40 GB |
+| `--s5` | windowed decode bit-identical (max_abs **0.0**) at chunk ≥ 48, same floor as the 0.6b |
+| `--validate` | unload returns MLX active **0 MB** and cache **0 MB** |
+
+### Not measured
+
+- In-app (engine-path) run — everything here is the headless CLI harness, so the registry
+  row is `Val 🟡`.
+- Quantized tiers — no int8/int4 variant published.
+- Any 512-frame utterance, per the envelope note above.

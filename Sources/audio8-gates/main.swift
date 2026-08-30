@@ -28,6 +28,19 @@ let goldensURL = ProcessInfo.processInfo.environment["AUDIO8_GOLDENS"].map { URL
 let modelDir = ProcessInfo.processInfo.environment["AUDIO8_MODEL_DIR"].map { URL(fileURLWithPath: $0) }
     ?? workspaceRoot.appendingPathComponent("release/Audio8-TTS-Preview-0.6b-bf16")
 
+/// The right package for whatever `AUDIO8_MODEL_DIR` points at.
+///
+/// The two Audio8 checkpoints are separate `ModelPackage` types because their manifests differ
+/// (licence, footprints, provenance, surface). Their behaviour does not — both delegate to
+/// `Audio8Runtime` — so the live gates below run either one through an existential, chosen from
+/// the checkpoint's own config.json rather than from a flag nobody would remember to pass.
+func makeAudio8Package(_ dir: URL) throws -> any ModelPackage & StreamEmitting {
+    let config = try ArkttsConfig.load(from: dir.appendingPathComponent("config.json"))
+    return config.usesFalconSlow
+        ? Audio8MiniPackage(configuration: Audio8MiniConfiguration(modelDirectory: dir))
+        : Audio8Package(configuration: Audio8Configuration(modelDirectory: dir))
+}
+
 func stderrPrint(_ message: String) {
     FileHandle.standardError.write((message + "\n").data(using: .utf8)!)
 }
@@ -641,7 +654,7 @@ func gateStream() async throws {
     let refAudio = Audio(format: .wav, data: try Data(contentsOf: refURL),
                          sampleRate: 44100, channels: 1)
 
-    let package = Audio8Package(configuration: Audio8Configuration(modelDirectory: modelDir))
+    let package = try makeAudio8Package(modelDir)
     try await package.load()
 
     let text = "This passage is long enough that streaming has something to prove: audio should "
@@ -702,7 +715,11 @@ func gateStream() async throws {
     // Both paths are windowed now, so the meaningful assertion is that each is BOUNDED —
     // parity between them is the expected outcome, not a failure. (An earlier version demanded
     // streaming < batch, which stopped being the right question once batch was fixed too.)
-    let bound = 4_200_000_000  // the declared peakActivationBytes
+    // Read the bound from the package under test, not from a constant. Hardcoding the 0.6b's
+    // 4.2 GB meant this gate asserted against a number Audio8MiniPackage does not declare —
+    // it happened to pass, which is exactly how a gate stops checking anything.
+    let bound = Int(type(of: package).manifest.requirements.footprints
+        .first { $0.quant == .bf16 }?.peakActivationBytes ?? 4_200_000_000)
     let bothBounded = batchPeak < bound && streamPeak < bound
     print(String(format: "  %@ both paths within the declared %.1f GB envelope "
                  + "(batch %.0f MB, stream %.0f MB)",
@@ -734,7 +751,7 @@ func gateStreamEnvelope() async throws {
     let refAudio = Audio(format: .wav, data: try Data(contentsOf: refURL),
                          sampleRate: 44100, channels: 1)
 
-    let package = Audio8Package(configuration: Audio8Configuration(modelDirectory: modelDir))
+    let package = try makeAudio8Package(modelDir)
     try await package.load()
     MLX.GPU.clearCache()
     let floor = MLX.Memory.activeMemory
@@ -784,7 +801,7 @@ func gateCancel() async throws {
     let refAudio = Audio(format: .wav, data: try Data(contentsOf: refWavURL),
                          sampleRate: 44100, channels: 1)
 
-    let package = Audio8Package(configuration: Audio8Configuration(modelDirectory: modelDir))
+    let package = try makeAudio8Package(modelDir)
     try await package.load()
 
     // A long request, so an uncancelled run would take many seconds.

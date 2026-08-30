@@ -103,3 +103,13 @@ extension Audio8Configuration: WeightPrewarming {
         ]
     }
 }
+
+// MARK: - Runtime seam
+
+extension Audio8Configuration: Audio8WeightResolving {
+    /// `resolved(storeRoot:)` in URL form — what `Audio8Runtime` actually needs, expressed
+    /// without the Self-returning shape that would make the runtime's generic awkward.
+    func resolvedModelDirectory(storeRoot: URL?) -> URL? {
+        resolved(storeRoot: storeRoot).modelDirectory
+    }
+}
