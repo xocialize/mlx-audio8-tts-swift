@@ -21,15 +21,26 @@ extension SPDXLicense {
     /// US$2M against US$10M, which is low enough to bind a real business rather than only a
     /// large one. Worth stating as a number rather than as "revenue-capped, like LTX-2".
     ///
-    /// Defined HERE rather than in MLXToolKit on purpose. Allowlisting changes what
-    /// `.permissiveOnly` admits fleet-wide and wants a contract bump plus a tagged engine
-    /// release — not something an audio port should land as a side effect. The engine-side
-    /// change is prepared on `mlx-engine-swift@audio8-community-license`; until it merges this
-    /// declaration is accurate but not on `permissiveAllowlist`, so the engine records a
-    /// `LicenseAdvisory` instead of admitting it silently. Enforcement defaults to `.advisory`
-    /// (contract 1.28.0), so that classifies rather than blocks — and a revenue cap is exactly
-    /// the kind of term a consuming app should be showing its users anyway. Delete this
-    /// extension when the engine constant lands.
+    /// Defined HERE rather than in MLXToolKit **by decision** (AB-D-0055, 2026-08-31), not as
+    /// a stopgap. Being off `permissiveAllowlist` means the engine records a `LicenseAdvisory`
+    /// rather than admitting this silently; since contract 1.28.0 enforcement defaults to
+    /// `.advisory`, that reports rather than blocks, so nothing is gated.
+    ///
+    /// That advisory is the point. A US$2M commercial cap is exactly the kind of term a
+    /// consuming app should be showing its users, and allowlisting would only remove a true
+    /// warning — it buys no capability, since the package already registers and runs.
+    ///
+    /// The tempting counter-argument, recorded so it is not re-litigated from scratch: the
+    /// fleet DOES allowlist `ltx2Community`, the same source-available-with-a-revenue-gate
+    /// shape, which additionally carries a non-compete this licence lacks. What decided it is
+    /// the threshold — **US$2M against LTX-2's US$10M**, 5x lower, low enough to bind a real
+    /// business rather than only a large one. "Revenue-capped, like LTX-2" is the summary that
+    /// hides that.
+    ///
+    /// The engine-side change is written and parked on
+    /// `mlx-engine-swift@audio8-community-license` so reversing costs a rebase, not a rewrite.
+    /// Do NOT merge it without revisiting AB-D-0055 — allowlisting changes what
+    /// `.permissiveOnly` admits fleet-wide and wants its own contract bump and tag.
     public static let audio8Community: SPDXLicense = "LicenseRef-Audio8-Community"
 }
 
