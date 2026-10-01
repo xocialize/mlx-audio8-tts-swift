@@ -1,5 +1,5 @@
 {
-  "originHash" : "9c9e6901e03d35b6139fda5fb87f65d99c4736af07f026bef18114d5aa0ebfc6",
+  "originHash" : "0886e95c6e95f1ecdb2b049278f048c0c9d5c19fcce0f0a1cc79231df0a9d40b",
   "pins" : [
     {
       "identity" : "eventsource",
@@ -24,26 +24,17 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/ml-explore/mlx-swift",
       "state" : {
-        "revision" : "0bb916c67f4b9e5c682cbe02a42c701c93ab5021",
-        "version" : "0.31.6"
+        "revision" : "19601207e9a0de51e03ee6ec0c3c5f3784275075",
+        "version" : "0.32.3"
       }
     },
     {
       "identity" : "mlx-swift-lm",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/xocialize/mlx-swift-lm",
+      "location" : "https://github.com/ml-explore/mlx-swift-lm",
       "state" : {
-        "branch" : "falcon-h1-encoder-spi",
-        "revision" : "ac28e3bdd44260bdeab13ae2b867a96df9696e1b"
-      }
-    },
-    {
-      "identity" : "swift-argument-parser",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/apple/swift-argument-parser",
-      "state" : {
-        "revision" : "6a52f3251125d74daf04fcbd5e6f08a75d074382",
-        "version" : "1.8.2"
+        "revision" : "3b339ad6e3b3f44c8121ecff5131c7fd55e075e6",
+        "version" : "3.32.3"
       }
     },
     {

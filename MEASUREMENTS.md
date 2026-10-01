@@ -368,21 +368,20 @@ failure this note is guarding against: a sample that never reaches the cap.
 
 The 0.6b's S2 proves greedy generation **token-exact** on CPU. That gate cannot exist for
 this checkpoint: `mlx-swift-lm`'s cached Mamba step is a `metal_kernel` and hard-errors on
-the CPU stream, so the rollout must run on GPU — and on GPU a token-exact comparison against
-a CPU oracle is impossible for a reason upstream of the language model. The codec's VQ
-nearest-neighbour encode is not code-exact across devices, so the reference codes differ and
-every frame after that is conditioned differently.
+the CPU stream, so the rollout must run on GPU. An earlier version of this section blamed the
+GPU-vs-CPU divergence on the codec's VQ encode. It was TF32: on M5-class GPUs mlx runs fp32
+matmuls in TF32 by default, and with `MLX_ENABLE_TF32=0` the GPU rollout is token-exact.
 
-    runtime            codec encode   greedy agreement vs the CPU oracle
-    Python-MLX  CPU       100%              100%  (token-exact)
-    Python-MLX  GPU      94.95%             7.76%
-    Swift       GPU      95.59%            12.06%
+    runtime                       greedy agreement vs the CPU oracle
+    Python-MLX  CPU                   100%  (token-exact)
+    Python-MLX  GPU, TF32 on          7.76%
+    Swift       GPU, TF32 on         12.06% (mlx-swift 0.31.6) / 7.29% (0.32.3)
+    Swift       GPU, TF32 off         100%  over 107 frames (0.31.6 and 0.32.3)
 
-This port agrees *better* than Python-MLX does on the same device, so the low number is a
-device effect rather than a defect here. Token-exactness for this checkpoint is established
-CPU-to-CPU by the Python-MLX harness (100% over 107 frames). `--s2gen` therefore checks
-rollout length and audio level and reports the agreement as information, explicitly not as a
-pass/fail — a number that cannot be high must not be wired to a gate.
+With TF32 on, the rollout length also wandered (108 frames on 0.31.6, 113 on 0.32.3, vs 107).
+`--s2gen` therefore sets `MLX_ENABLE_TF32=0` for itself and gates on exact length and 100% code
+agreement, plus audio level (2026-10-01). Production runs the bf16 LM, which TF32 does not
+touch. The codec-encode figures in trap 2 below were measured with TF32 on.
 
 Two traps banked while finding this:
 

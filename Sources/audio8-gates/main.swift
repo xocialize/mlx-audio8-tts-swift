@@ -271,24 +271,19 @@ func gateS2() throws {
 
 /// The generation rollout for `falcon_h1`, on the GPU because it has to be (see `gateS2`).
 ///
-/// Deliberately NOT a token-parity proof, and the code-agreement line below is reported as
-/// information rather than checked. A GPU rollout CANNOT be token-exact against a CPU
-/// oracle here, and the reason is upstream of the language model: the codec's VQ
-/// nearest-neighbour encode is not code-exact across devices, so the reference codes differ,
-/// the prompt differs, and every frame after that is conditioned differently.
+/// Token-exact against the CPU oracle, with TF32 off (`MLX_ENABLE_TF32=0`, set at entry for
+/// this mode). On M5-class GPUs mlx runs fp32 matmuls in TF32 by default, and that rounding —
+/// not the codec's VQ encode — is what made the GPU rollout diverge before:
 ///
-/// Measured, same checkpoint, same reference clip, deterministic decoding:
+///     runtime                         greedy agreement vs the CPU oracle
+///     Python-MLX  CPU                     100%  (token-exact)
+///     Python-MLX  GPU, TF32 on            7.76%
+///     Swift       GPU, TF32 on           12.06% (mlx-swift 0.31.6) / 7.29% (0.32.3)
+///     Swift       GPU, TF32 off           100%  over 107 frames (0.31.6 and 0.32.3)
 ///
-///     runtime            codec encode    greedy agreement vs the CPU oracle
-///     Python-MLX  CPU        100%              100%  (token-exact)
-///     Python-MLX  GPU       94.95%             7.76%
-///     Swift       GPU       95.59%            12.06%
-///
-/// Swift agrees slightly BETTER than Python-MLX does on the same device, so a low number
-/// here is a device effect, not a defect in this port. Token-exactness for this checkpoint
-/// is established CPU-to-CPU (gateS2 above, and parity_mlx.py at 100% over 107 frames).
-/// What this gate adds is the one thing those cannot reach: that the Swift cached-Mamba
-/// path runs at all and produces audio of the right length and level.
+/// With TF32 on the rollout length also wandered (108 frames on 0.31.6, 113 on 0.32.3 vs
+/// 107). Production runs the bf16 LM, which TF32 does not touch; this gate runs the fp32 LM
+/// so it can prove the Swift cached-Mamba path token-for-token.
 func gateS2Gen() throws {
     Device.setDefault(device: Device(.gpu))
     let goldens = loadGoldens()
@@ -318,20 +313,17 @@ func gateS2Gen() throws {
     let frames = generated.shape[2]
     let goldenFrames = goldenGreedy.shape[2]
     print("  --   greedy frames: swift(GPU) \(frames) vs oracle(CPU) \(goldenFrames)")
-    // Length within a frame or two, and the shared prefix mostly agreeing, is what a
-    // correct-but-not-bit-identical rollout looks like. A broken one diverges immediately.
-    let lengthOK = abs(frames - goldenFrames) <= 2
-    print("  \(lengthOK ? "ok  " : "FAIL") rollout length within 2 frames of the oracle")
+    let lengthOK = frames == goldenFrames
+    print("  \(lengthOK ? "ok  " : "FAIL") rollout length matches the oracle")
     if !lengthOK { failures.append("greedy length \(frames) vs \(goldenFrames)") }
 
     let shared = min(frames, goldenFrames)
     let agree = (generated[0..., 0..., ..<shared] .== goldenGreedy[0..., 0..., ..<shared])
         .asType(.float32).mean().item(Float.self)
-    // Informational. See this function's doc comment: cross-device VQ encode makes a high
-    // number impossible, so this is NOT a pass/fail check. Python-MLX on the same device
-    // scores 7.76% against the same oracle.
-    print("  --   code agreement over the shared \(shared) frames: \(agree * 100)% "
-        + "(informational — cross-device; python-mlx GPU scores 7.76% here)")
+    let exact = agree == 1
+    print("  \(exact ? "ok  " : "FAIL") code agreement over the shared \(shared) frames: \(agree * 100)% "
+        + "(token-exact with TF32 off)")
+    if !exact { failures.append("greedy code agreement \(agree * 100)%") }
 
     // The load-bearing check: the audio must be real speech, not silence or noise.
     let wave = model.codec.decode(generated)
@@ -845,6 +837,8 @@ func gateCancel() async throws {
 // MARK: entry
 
 let mode = CommandLine.arguments.dropFirst().first ?? "--s1"
+// mlx reads MLX_ENABLE_TF32 once, at the first matmul, so it has to be set before any MLX work.
+if mode == "--s2gen" { setenv("MLX_ENABLE_TF32", "0", 1) }
 stderrPrint("audio8-gates \(mode)  model=\(modelDir.path)")
 switch mode {
 case "--s0": try gateS0()
