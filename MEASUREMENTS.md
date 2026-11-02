@@ -406,3 +406,24 @@ Two traps banked while finding this:
   row is `Val 🟡`.
 - Quantized tiers — no int8/int4 variant published.
 - Any 512-frame utterance, per the envelope note above.
+
+## 2026-11-01 — v0.4.0: Audio8-TTS-Realistic-0.6b (`Audio8RealisticPackage`) + batch-window fix
+
+Full record: `WIP/audio8-tts/realistic-0.6b/MEASUREMENTS.md` §4 (mlxengine-audio). Realistic measures identical to
+the Preview: resident 2434 MiB, stream flat at 3482 MiB from 79 to 527 frames, RTF 0.96, all live gates green.
+
+### Batch transient at tail lengths (AB-L-0323)
+
+Until v0.4.0 `decodeStreaming` folded a remainder under 16 frames into the last window, so the batch path peaked
+at lengths 64k + 1…15: **+4031 MiB at 268 frames**, past the then-declared 4.2e9 B. Every earlier sweep used round
+lengths and missed it. Near-equal chunks bound it: batch ≤ 3567 MiB across 256–527 frames, 3658 MiB worst
+(a single 79-frame window). Streaming was never affected.
+
+### Declarations, in bytes
+
+| | before | v0.4.0 |
+|---|---|---|
+| resident (2434 MiB × 1.07) | 2.60e9 (MiB read as MB) | **2.75e9** |
+| activation (3658 MiB × 1.13) | 4.20e9 | **4.35e9** |
+
+Both 0.6b packages. The Mini's 1.81e9 / 4.40e9 were already converted correctly.

@@ -24,6 +24,7 @@ the artifacts drifted apart historically — the scripts previously assumed a si
 |---|---|---|
 | `AUDIO8_WORK` | `…/mlxengine-audio/WIP/audio8-tts` | `reference/Audio8-TTS-Preview-0.6b`, `mlx-audio/` (shared with the 0.1b harness) |
 | `AUDIO8_06B_DATA` | `…/mlxengine-audio/PROD/Audio8` | `oracle-capture/{goldens,converted}`, `release/` |
+| `AUDIO8_06B_CHECKPOINT` | `Audio8-TTS-Preview-0.6b` | which `reference/<name>` snapshot to read; the release lands in `release/<name>-bf16`. `Audio8-TTS-Realistic-0.6b` (E28) is the same graph with new LM values — give it its own `AUDIO8_06B_DATA` (`WIP/audio8-tts/realistic-0.6b`) |
 
 Consolidating the two under one root would be tidier and is deliberately **not** done here — that
 is a data move, and this change is only about getting the scripts versioned and running again.
@@ -34,9 +35,20 @@ is a data move, and this change is only about getting the scripts versioned and 
 |---|---|
 | `convert_codec.py` | codec weights → `converted/codec_raw.safetensors` (fp32) |
 | `capture_goldens.py` | PyTorch reference, fp32 CPU, deterministic (`do_sample=False`) → `.npy` goldens + `manifest.json`: e2e fixtures, hooked intermediates, seeded unit fixtures |
+| `pack_goldens.py` | the `.npy` goldens → `goldens/arktts_goldens.safetensors` (ints int32, floats fp32), the bundle `audio8-gates` reads |
 | `parity_mlx.py` | full Python-MLX parity against those goldens |
 | `gen_smoke.py` | end-to-end MLX smoke render → `goldens/mlx_smoke_bf16.wav` |
 | `build_release_repo.py` | assembles the publishable bf16 MLX repo |
+
+## The oracle needs transformers < 5
+
+`capture_goldens.py` must run under upstream's tested pair — torch 2.8.0 + torchaudio 2.8.0 + transformers 4.57.3
+(the card pins `transformers>=4.57,<5`). Under transformers 5.x the reference's RoPE tables come out
+uninitialised (zeros and denormals) and every attention golden is garbage, while nothing errors. This is what
+happened in 2026-11 when the July venv had drifted to 5.14.1. The pinned venv is
+`WIP/audio8-tts/realistic-0.6b/.venv-oracle` (freeze in `_logs/venv-oracle.freeze.txt`); re-capturing the Preview
+goldens under it reproduces July's integer fixtures exactly. The MLX-side scripts (`pack_goldens.py`,
+`build_release_repo.py`, `parity_mlx.py`) keep using the `mlx` venv.
 
 ## Caveat carried from the port
 

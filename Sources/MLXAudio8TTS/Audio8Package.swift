@@ -8,6 +8,10 @@ import MLXToolKit
 /// zero-shot voice cloning from a reference clip + its transcript. Returns the canonical
 /// `Audio` (.wav, 44.1 kHz mono).
 ///
+/// **`Audio8RealisticPackage` is the recommended 0.6b checkpoint** since v0.4.0: same graph and
+/// codec, tied on the core languages, many more languages. This one stays for callers that
+/// want its shorter pauses (Realistic's takes run ~13% longer, all of it silence).
+///
 /// Engine-owned lifecycle (C13): the engine constructs from an `Audio8Configuration`, pages
 /// weights in with `load()` (auto-materializing the declared source under the engine's models
 /// root when set), drives `run(_:)`, and reclaims with `unload()`.
@@ -30,9 +34,11 @@ import MLXToolKit
 public final class Audio8Package: ModelPackage, StreamEmitting {
     public typealias Configuration = Audio8Configuration
 
-    /// Split footprints — MEASURED. MEASUREMENTS.md carries every pass.
-    ///   • resident floor (MLX-active, post-load, pre-run): 2434 MB → declared 2.60 GB.
-    ///   • activation: **FLAT at 3482 MB**, independent of utterance length → declared 4.20 GB.
+    /// Split footprints — MEASURED. MEASUREMENTS.md carries every pass. The gates print MiB;
+    /// these are bytes, with the fleet's ×1.07 / ×1.13 margins applied after converting.
+    ///   • resident floor (MLX-active, post-load, pre-run): 2434 MiB → declared 2.75e9 B.
+    ///   • activation: bounded at **3658 MiB** (a single 79-frame window; multi-window decodes
+    ///     top out at 3567), independent of utterance length → declared 4.35e9 B.
     ///
     /// The activation envelope stopped being a function of the input in v0.2.0, when the
     /// windowed decode landed and `generate` was routed through it. Before that the transient
@@ -43,13 +49,20 @@ public final class Audio8Package: ModelPackage, StreamEmitting {
     ///     v0.1.1  7.20 GB   from a corpus sweep topping out at 15.7 s
     ///     v0.1.2  9.50 GB   from the fitted model at the default maxFrames cap
     ///     v0.2.1  4.20 GB   MEASURED FLAT — the length dependence is gone
+    ///     v0.4.0  4.35e9 B  the same envelope, now converted from MiB correctly (AB-L-0116)
+    ///
+    /// The 4.20 GB of v0.2.1 – v0.3.x was 3482 MiB × 1.13 written as decimal MB, and 2.60 GB
+    /// was 2434 MiB × 1.07 the same way: inside the measured peaks, but with margins of 9 % and
+    /// 2 %, not 13 % and 7 %. The batch decode also had a length-specific overshoot until v0.4.0:
+    /// a remainder under 16 frames was absorbed into the last window, which then reached 90
+    /// frames and +4031 MiB at 268 frames — past that 4.20 GB. See `decodeStreaming`.
     ///
     /// Verified across 64 → 224 frames in one sweep and against a 1035-frame run: 3482 MB every
-    /// time. That is worth more than the 5.3 GB reduction itself — a declaration the governor
+    /// time on the streaming path (the batch overshoot above sat at other lengths). That is worth more than the 5.3 GB reduction itself — a declaration the governor
     /// reserves is only meaningful if the real envelope cannot exceed it, and this one now
     /// cannot. `maxFrames` no longer changes the memory story, only the duration.
-    nonisolated static let bf16ResidentBytes: UInt64 = 2_600_000_000
-    nonisolated static let peakActivationBytes: UInt64 = 4_200_000_000
+    nonisolated static let bf16ResidentBytes: UInt64 = 2_750_000_000
+    nonisolated static let peakActivationBytes: UInt64 = 4_350_000_000
 
     public nonisolated static var manifest: PackageManifest {
         PackageManifest(

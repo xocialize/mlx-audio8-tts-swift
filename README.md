@@ -1,11 +1,29 @@
 # mlx-audio8-tts-swift
 
-Swift-MLX port of **[Audio8-TTS-Preview-0.6b](https://huggingface.co/Audio8/Audio8-TTS-Preview-0.6b)**
-— a multilingual, zero-shot voice-cloning text-to-speech model — wrapped as a conformant
-[MLXEngine](https://github.com/xocialize/mlx-engine-swift) `tts` `ModelPackage` for Apple Silicon.
+Swift-MLX port of the **Audio8-TTS** family — multilingual, zero-shot voice-cloning
+text-to-speech models — wrapped as conformant
+[MLXEngine](https://github.com/xocialize/mlx-engine-swift) `tts` `ModelPackage`s for Apple Silicon.
 
-Clone a voice from one reference clip plus its transcript, and speak in any of 11 languages.
+Clone a voice from one reference clip plus its transcript, and speak in up to 17 languages.
 44.1 kHz mono `.wav` out.
+
+## Checkpoints
+
+One runtime, three packages. The checkpoints share the DualAR shape and the codec, byte for byte,
+so they differ only in their manifests and default weights.
+
+| Package | Checkpoint | Weights | Choose it for |
+|---|---|---|---|
+| **`Audio8RealisticPackage`** | [Edge0/Audio8-TTS-Realistic-0.6b](https://huggingface.co/Edge0/Audio8-TTS-Realistic-0.6b) | `mlx-community/Audio8-TTS-Realistic-0.6b-bf16` | **the default.** 17 languages, plus Hindi, Norwegian and Swedish as experimental |
+| `Audio8Package` | [Audio8/Audio8-TTS-Preview-0.6b](https://huggingface.co/Audio8/Audio8-TTS-Preview-0.6b) | `mlx-community/Audio8-TTS-Preview-0.6b-bf16` | speech that must fit a tight time slot (fewer pauses) |
+| `Audio8MiniPackage` | [Audio8/Audio8-TTS-Preview-0.1b](https://huggingface.co/Audio8/Audio8-TTS-Preview-0.1b) | `mlx-community/Audio8-TTS-Preview-0.1b-bf16` | footprint: ~800 MB lighter resident. Lower similarity, 8 languages, revenue-capped licence |
+
+Realistic and Preview are tied on the six languages we measured both on (en, zh, de, es, fr, ja).
+Error rate is 0.0126 vs 0.0122 and speaker similarity is 0.7211 vs 0.7212.
+
+Realistic pauses more. Its takes run ~13% longer, and all of the extra time is silence. It also
+adds Finnish, Indonesian, Malay, Portuguese, Russian and Turkish at 1–7% error, where the Preview
+scores 11–75% on them.
 
 ```
 reference clip ──▶ arktts codec encode ──▶ semantic + residual codes ┐
@@ -16,10 +34,12 @@ text + transcript ──▶ Qwen tokenizer ──▶ chat-format prompt ──�
 ## Highlights
 
 - **Token-exact with the PyTorch reference.** Greedy decoding reproduces the original model's
-  code sequence for **102/102 frames**, and codec encoding is 100% code-exact. The port is
+  code sequence for **102/102 frames** (Preview) and **129/129** (Realistic), and codec encoding
+  is 100% code-exact. The port is
   exact, not merely close — see the gate table below.
 - **Multilingual**: Cantonese, Chinese, Dutch, English, French, German, Italian, Japanese,
-  Korean, Polish, Spanish.
+  Korean, Polish, Spanish on every 0.6b checkpoint. Realistic adds Finnish, Indonesian, Malay,
+  Portuguese, Russian and Turkish.
 - **Zero-shot cloning** from a reference clip + transcript (ICL-style — the transcript must match
   what the clip says). `voice.auto` uses the model's own default voice.
 - **Faster than realtime**: RTF **0.96** on a 9.2 s utterance (release build, bf16 LM + fp32 codec).
@@ -35,14 +55,14 @@ Two modules (the fleet's core/wrapper split):
 | Module | Role |
 |---|---|
 | **`Audio8TTSCore`** | The inference port — the DualAR transformer (24-layer slow AR emitting one semantic token per audio frame, 4-layer fast AR emitting that frame's 10 codec codebooks), the 44.1 kHz arktts codec (DAC-style encoder/decoder, split semantic + residual RVQ, windowed transformer pre/post modules), reference-exact sampling, and the prompt builder. Depends on MLX + swift-transformers only — **MLXToolKit-free**. |
-| **`MLXAudio8TTS`** | The engine-facing wrapper — `Audio8Configuration` + `Audio8Package` (the `tts` surface), the license gate, `WeightSourcing` auto-materialization, and the cancellation seams. |
+| **`MLXAudio8TTS`** | The engine-facing wrapper — one configuration + `ModelPackage` per checkpoint (the `tts` surfaces) over a shared `Audio8Runtime`, the license gate, `WeightSourcing` auto-materialization, and the cancellation seams. |
 
 ## Install
 
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/xocialize/mlx-audio8-tts-swift", from: "0.1.0"),
+    .package(url: "https://github.com/xocialize/mlx-audio8-tts-swift", from: "0.4.0"),
 ]
 ```
 
@@ -57,7 +77,7 @@ drives, and evicts it.
 ```swift
 import MLXAudio8TTS
 
-try engine.register(Audio8Package.self, configuration: Audio8Configuration())
+try engine.register(Audio8RealisticPackage.self, configuration: Audio8RealisticConfiguration())
 try await engine.prepare(.tts)
 
 let response = try await engine.run(TTSRequest(
@@ -109,8 +129,9 @@ reference (45 tensors).
 | `--validate` | the engine path + measured footprint | RTF 0.96, −18.8 dBFS, footprint table |
 | `--cancel` | live MID-RUN cancellation (the offline gate only covers the entry checkpoint) | unwrapped `CancellationError` 30 ms after cancel |
 
-Offline conformance (manifest, MAT-1..5, CAN-1..3, C14/INF) runs in `swift test` — 15 tests.
+Offline conformance (manifest, MAT-1..5, CAN-1..3, C14/INF) runs in `swift test` — 44 tests across the three packages.
 
 ## License
 
-Apache-2.0, matching the upstream model weights.
+The port code is Apache-2.0. Both 0.6b checkpoints' weights are Apache-2.0. The 0.1b's LM
+carries the Audio8 Community License, which permits commercial use only below US$2M annual revenue.

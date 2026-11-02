@@ -42,6 +42,12 @@ final class ManifestConformanceTests: XCTestCase {
         // that would mean the declaration was never measured.
         XCTAssertGreaterThan(footprint.residentBytes, 2_500_000_000,
                              "resident floor is below the weight bytes — was it measured?")
+        // Measured in MiB by the gates; compared in bytes (AB-L-0116). Until v0.4.0 both
+        // declarations were the MiB figures with margins applied as if they were decimal MB.
+        XCTAssertGreaterThan(footprint.residentBytes, 2434 << 20,
+                             "declared resident is below the measured 2434 MiB floor")
+        XCTAssertGreaterThan(footprint.peakActivationBytes, 3658 << 20,
+                             "declared activation is below the measured 3658 MiB batch transient")
     }
 
     /// C6 — every declared specialty is in the engine's registered vocabulary (the check that

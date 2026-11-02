@@ -21,8 +21,10 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(WORK / "mlx-audio"))
 from mlx_audio.tts.models.arktts import Model, ModelConfig  # noqa: E402
 
-REPO = WORK / "reference" / "Audio8-TTS-Preview-0.6b"
-OUT = DATA / "release" / "Audio8-TTS-Preview-0.6b-bf16"
+# AUDIO8_06B_CHECKPOINT picks the 0.6b checkpoint: Preview (default) or Realistic — same graph, new LM values.
+CHECKPOINT = os.environ.get("AUDIO8_06B_CHECKPOINT", "Audio8-TTS-Preview-0.6b")
+REPO = WORK / "reference" / CHECKPOINT
+OUT = DATA / "release" / f"{CHECKPOINT}-bf16"
 OUT.mkdir(parents=True, exist_ok=True)
 
 config_dict = json.loads((REPO / "config.json").read_text())

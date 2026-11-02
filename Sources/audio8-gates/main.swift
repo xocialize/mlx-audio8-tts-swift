@@ -30,14 +30,20 @@ let modelDir = ProcessInfo.processInfo.environment["AUDIO8_MODEL_DIR"].map { URL
 
 /// The right package for whatever `AUDIO8_MODEL_DIR` points at.
 ///
-/// The two Audio8 checkpoints are separate `ModelPackage` types because their manifests differ
-/// (licence, footprints, provenance, surface). Their behaviour does not — both delegate to
-/// `Audio8Runtime` — so the live gates below run either one through an existential, chosen from
-/// the checkpoint's own config.json rather than from a flag nobody would remember to pass.
+/// The Audio8 checkpoints are separate `ModelPackage` types because their manifests differ
+/// (licence, footprints, provenance, surface). Their behaviour does not — all delegate to
+/// `Audio8Runtime` — so the live gates below run any one through an existential, chosen from
+/// the checkpoint itself rather than from a flag nobody would remember to pass. The 0.1b is
+/// told apart by its config.json (`slow_backbone`). The two 0.6b checkpoints have identical
+/// configs and tensor layouts — only the values differ — so the bundle's name decides; both
+/// the release layout and the model store name the directory after the repo.
 func makeAudio8Package(_ dir: URL) throws -> any ModelPackage & StreamEmitting {
     let config = try ArkttsConfig.load(from: dir.appendingPathComponent("config.json"))
-    return config.usesFalconSlow
-        ? Audio8MiniPackage(configuration: Audio8MiniConfiguration(modelDirectory: dir))
+    if config.usesFalconSlow {
+        return Audio8MiniPackage(configuration: Audio8MiniConfiguration(modelDirectory: dir))
+    }
+    return dir.standardizedFileURL.lastPathComponent.contains("Realistic")
+        ? Audio8RealisticPackage(configuration: Audio8RealisticConfiguration(modelDirectory: dir))
         : Audio8Package(configuration: Audio8Configuration(modelDirectory: dir))
 }
 
@@ -67,8 +73,9 @@ func check(_ name: String, _ got: MLXArray, _ golden: MLXArray, tol: Float) {
         return
     }
     let diff = abs(gotF - goldenF).max().item(Float.self)
+    // `!(diff < tol)`, not `diff >= tol`: a NaN diff (a broken oracle or a broken port) must fail.
     let status = diff < tol ? "ok  " : "FAIL"
-    if diff >= tol { failures.append("\(name): max_abs \(diff)") }
+    if !(diff < tol) { failures.append("\(name): max_abs \(diff)") }
     print("  \(status) \(name)  max_abs \(diff)")
 }
 
@@ -417,8 +424,7 @@ func gateValidate() async throws {
 
     let baseline = physFootprintMB()
     MLX.Memory.clearCache()
-    let package = Audio8Package(
-        configuration: Audio8Configuration(modelDirectory: modelDir))
+    let package = try makeAudio8Package(modelDir)
 
     // --- load ---
     let loadStart = Date()
@@ -507,8 +513,7 @@ func gateValidate() async throws {
 
     // --- transient scaling: the peak is utterance-length-driven, so show the slope ---
     GPU.resetPeakMemory()
-    let shortPackage = Audio8Package(
-        configuration: Audio8Configuration(modelDirectory: modelDir))
+    let shortPackage = try makeAudio8Package(modelDir)
     try await shortPackage.load()
     let shortResident = MLX.Memory.activeMemory
     GPU.resetPeakMemory()
@@ -585,6 +590,62 @@ func gateS5() throws {
             print("  \(bounded ? "note" : "FAIL") chunk \(chunk) frames: max_abs \(diff)  "
                   + "[below floor \(floor); drift expected, bounded]")
         }
+    }
+
+    // Exactness vs UTTERANCE LENGTH at the default chunk. The split is ceil(T / 64) near-equal
+    // chunks, so the lengths that matter are the awkward ones — just past a multiple of 64,
+    // where the old rule built an oversized last window. Codes are the goldens tiled in time:
+    // valid codebook entries, so the decode is a real one, and only equality is asserted.
+    let reps = 527 / frames + 1
+    let tiled = concatenated(Array(repeating: codes, count: reps), axis: 2)
+    for total in [96, 192, 265, 268, 271, 335, 527] {
+        let slice = tiled[0..., 0..., ..<total]
+        let reference = codec.decode(slice)
+        var pieces: [MLXArray] = []
+        var largest = 0
+        var previous = 0
+        try codec.decodeStreaming(slice) { s, _ in
+            pieces.append(s)
+            let emitted = pieces.reduce(0) { $0 + $1.shape[1] } / ArkttsCodec.frameLength
+            largest = max(largest, emitted - previous)
+            previous = emitted
+        }
+        let streamed = concatenated(pieces, axis: 1)
+        eval(reference, streamed)
+        let diff = streamed.shape == reference.shape
+            ? abs(reference - streamed).max().item(Float.self) : Float.nan
+        let bounded = largest <= 64
+        if !bounded { failures.append("S5 length \(total): a \(largest)-frame chunk exceeds 64") }
+        // The pre-v0.4.0 rule (full chunks, a short remainder absorbed into the last one), for
+        // comparison only: its exactness at these lengths was never measured before.
+        let latent = codec.postModuleLatent(slice)
+        var legacy: [MLXArray] = []
+        var start = 0
+        while start < total {
+            var end = min(start + 64, total)
+            if total - end < 16 { end = total }
+            let windowStart = max(0, start - codec.leftReceptiveFieldFrames)
+            let decoded = codec.decodeFromLatent(latent[0..., windowStart ..< end])
+            legacy.append(decoded[0..., ((start - windowStart) * ArkttsCodec.frameLength)...])
+            start = end
+        }
+        let legacyWave = concatenated(legacy, axis: 1)
+        eval(legacyWave)
+        let legacyDiff = abs(reference - legacyWave).max().item(Float.self)
+        // On the GPU, past ~200 frames the WHOLE decode itself selects different conv kernels,
+        // so neither split is bit-equal to it there (7.4e-5 at 265, 2.1e-4 at 527 — the same to
+        // the digit under both rules). What this asserts is no regression against the old rule,
+        // the sub-floor drift bound, and the chunk bound. The CPU stream is not an exact oracle
+        // either: its fp32 conv accumulation is size-dependent too (~1e-6 at every chunk size,
+        // old rule included), so exactness is required only on the GPU at ≤ 192 frames.
+        let exactRequired = !onCPU && total <= 192
+        let ok = diff.isFinite && diff <= legacyDiff && diff <= 2e-3 && (!exactRequired || diff == 0)
+        if !ok {
+            failures.append("S5 length \(total): max_abs \(diff) (old rule \(legacyDiff)"
+                            + "\(exactRequired ? ", must be exactly 0" : "") )")
+        }
+        print("  \(ok && bounded ? "ok  " : "FAIL") length \(total) frames: max_abs \(diff), "
+              + "largest chunk \(largest)   [old rule: max_abs \(legacyDiff)]")
     }
 
     // Empirical context sweep: find the SMALLEST context that is exact at a small chunk size.
@@ -751,18 +812,34 @@ func gateStreamEnvelope() async throws {
     print("  frames   batch peak      stream peak")
 
     // maxFrames drives utterance length; greedy keeps it deterministic across the two paths.
-    for cap in [64, 128, 256, 512] {
+    // AUDIO8_ENV_CAPS (comma-separated) overrides the rungs and switches to a passage long enough
+    // that every rung ends AT its cap rather than at EOS: the batch decode's last window is
+    // `context + 64 + (total mod 64)` frames when the remainder is under its 16-frame tail floor,
+    // so the envelope's worst case sits at specific lengths (64k + 15), not at the longest one.
+    let envCaps = ProcessInfo.processInfo.environment["AUDIO8_ENV_CAPS"]
+        .map { $0.split(separator: ",").compactMap { Int($0) } }
+    let envText = envCaps == nil
+        ? "This passage exists to be generated at a controlled length so the "
+            + "activation envelope can be measured against the number of frames the "
+            + "model actually produces, rather than against a single sample."
+        : String(repeating: "This passage exists to be generated at a controlled length, and it "
+            + "keeps going well past the point where any rung of the sweep would stop, so that "
+            + "each run ends at its frame cap instead of at the end of the text. ", count: 6)
+    for cap in envCaps ?? [64, 128, 256, 512] {
         func request() -> TTSRequest {
-            TTSRequest(text: "This passage exists to be generated at a controlled length so the "
-                       + "activation envelope can be measured against the number of frames the "
-                       + "model actually produces, rather than against a single sample.",
+            TTSRequest(text: envText,
                        voice: VoiceSelector(.referenceAudio(refAudio)),
                        referenceTranscript: refText,
-                       metaData: ["seed": .int(5), "greedy": .bool(true), "maxFrames": .int(cap)])
+                       // Greedy reaches EOS early on the long passage (235 frames on Realistic
+                       // whatever the cap), so the forced-length rungs sample instead — seeded,
+                       // and each path's own frame count is reported.
+                       metaData: ["seed": .int(5), "greedy": .bool(envCaps == nil),
+                                  "maxFrames": .int(cap)])
         }
         MLX.GPU.clearCache(); GPU.resetPeakMemory()
-        _ = try await package.run(request())
+        let batch = try await package.run(request()) as? TTSResponse
         let batchPeak = MLX.Memory.peakMemory - floor
+        let batchFrames = ((batch?.audio.data.count ?? 44) - 44) / 2 / ArkttsCodec.frameLength
 
         MLX.GPU.clearCache(); GPU.resetPeakMemory()
         var frames = 0
@@ -770,8 +847,9 @@ func gateStreamEnvelope() async throws {
             frames += chunk.samples.count / ArkttsCodec.frameLength
         }
         let streamPeak = MLX.Memory.peakMemory - floor
-        print(String(format: "  %5d    %7.0f MB      %7.0f MB",
-                     frames, Double(batchPeak) / 1_048_576, Double(streamPeak) / 1_048_576))
+        print(String(format: "  %5d    %7.0f MB      %7.0f MB%@",
+                     frames, Double(batchPeak) / 1_048_576, Double(streamPeak) / 1_048_576,
+                     batchFrames == frames ? "" : "   (batch ran \(batchFrames) frames)"))
     }
     await package.unload()
     finish("STREAMENV")
@@ -834,6 +912,65 @@ func gateCancel() async throws {
     finish("CANCEL")
 }
 
+// MARK: - --render: batch renders through the engine package (A/B evaluation lanes)
+
+/// One render per line of a JSONL jobs file, through the real package for the bundle (the shipped path:
+/// reference resampling, metaData defaults, windowed decode). A job is
+/// `{"id", "text", "ref", "ref_sr", "ref_text", "seed", "out"}`; an existing `out` is skipped so a
+/// run resumes. One result line per render goes to `<jobs>.results.jsonl`.
+func gateRender() async throws {
+    let args = CommandLine.arguments
+    guard args.count > 2 else { stderrPrint("usage: audio8-gates --render <jobs.jsonl> [maxFrames]"); exit(2) }
+    let jobsURL = URL(fileURLWithPath: args[2])
+    let maxFrames = args.count > 3 ? Int(args[3]) ?? 600 : 600
+    let resultsURL = jobsURL.deletingPathExtension().appendingPathExtension("results.jsonl")
+    if !FileManager.default.fileExists(atPath: resultsURL.path) {
+        FileManager.default.createFile(atPath: resultsURL.path, contents: nil)
+    }
+    let results = try FileHandle(forWritingTo: resultsURL)
+    results.seekToEndOfFile()
+
+    let jobs = try String(contentsOf: jobsURL, encoding: .utf8).split(separator: "\n")
+        .compactMap { try JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
+    let package = try makeAudio8Package(modelDir)
+    try await package.load()
+    var refs: [String: Audio] = [:]
+    for (index, job) in jobs.enumerated() {
+        let id = job["id"] as! String, out = URL(fileURLWithPath: job["out"] as! String)
+        if FileManager.default.fileExists(atPath: out.path) { continue }
+        let refPath = job["ref"] as! String
+        if refs[refPath] == nil {
+            refs[refPath] = Audio(format: .wav, data: try Data(contentsOf: URL(fileURLWithPath: refPath)),
+                                  sampleRate: job["ref_sr"] as? Int ?? 24000, channels: 1)
+        }
+        let request = TTSRequest(
+            text: job["text"] as! String,
+            voice: VoiceSelector(.referenceAudio(refs[refPath]!)),
+            referenceTranscript: job["ref_text"] as? String,
+            metaData: ["seed": .int(job["seed"] as! Int), "maxFrames": .int(maxFrames)])
+        let start = Date()
+        guard let tts = try await package.run(request) as? TTSResponse else {
+            stderrPrint("\(id): run() did not return a TTSResponse"); exit(1)
+        }
+        let seconds = Date().timeIntervalSince(start)
+        try FileManager.default.createDirectory(at: out.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try tts.audio.data.write(to: out)
+        let samples = (tts.audio.data.count - 44) / 2
+        let duration = Double(samples) / Double(tts.audio.sampleRate ?? ArkttsCodec.sampleRate)
+        // frames from the sample count: the codec emits exactly frameSize samples per frame
+        let frames = samples / 2048
+        let line: [String: Any] = ["id": id, "out": out.path, "seconds": seconds, "duration": duration,
+                                   "frames": frames, "hit_cap": frames >= maxFrames,
+                                   "rtf": duration > 0 ? seconds / duration : -1]
+        results.write(try JSONSerialization.data(withJSONObject: line) + Data("\n".utf8))
+        print(String(format: "  [%d/%d] %@  %.2fs audio in %.2fs%@", index + 1, jobs.count, id, duration,
+                     seconds, frames >= maxFrames ? "  HIT CAP" : ""))
+        MLX.Memory.clearCache()
+    }
+    await package.unload()
+    print("RENDER: done → \(resultsURL.path)")
+}
+
 // MARK: entry
 
 let mode = CommandLine.arguments.dropFirst().first ?? "--s1"
@@ -846,12 +983,13 @@ case "--s5": try gateS5()
 case "--s1": try gateS1()
 case "--s2": try gateS2()
 case "--s2gen": try gateS2Gen()
-case "--s2b", "--validate", "--cancel", "--stream", "--streamenv":
+case "--s2b", "--validate", "--cancel", "--stream", "--streamenv", "--render":
     let semaphore = DispatchSemaphore(value: 0)
     Task {
         do {
             switch mode {
             case "--s2b": try await gateS2b()
+            case "--render": try await gateRender()
             case "--cancel": try await gateCancel()
             case "--stream": try await gateStream()
             case "--streamenv": try await gateStreamEnvelope()

@@ -29,7 +29,9 @@ from mlx_audio.tts.models.arktts import Model, ModelConfig  # noqa: E402
 from mlx_audio.tts.models.arktts.arktts import ArkttsModel  # noqa: E402
 
 GOLD = HARNESS / "goldens"
-REPO = WORK / "reference" / "Audio8-TTS-Preview-0.6b"
+# AUDIO8_06B_CHECKPOINT picks the 0.6b checkpoint: Preview (default) or Realistic — same graph, new LM values.
+CHECKPOINT = os.environ.get("AUDIO8_06B_CHECKPOINT", "Audio8-TTS-Preview-0.6b")
+REPO = WORK / "reference" / CHECKPOINT
 
 FAILURES = []
 

@@ -429,16 +429,25 @@ public final class ArkttsCodec: @unchecked Sendable {
         let context = max(0, contextFrames ?? leftReceptiveFieldFrames)
         let step = max(1, chunkFrames)
 
-        // Never emit a degenerate final chunk: if the remainder after this one would be
-        // smaller than `minTail`, absorb it here instead. Two reasons — a tiny decode is pure
-        // overhead (it still pays the full `context` re-decode), and MLX selects different conv
-        // kernels for very small inputs, so a stub window is where windowed output stops being
-        // bit-reproducible against the whole-utterance decode on the GPU stream.
+        // Never emit a degenerate final chunk — a tiny decode is pure overhead (it still pays
+        // the full `context` re-decode), and MLX selects different conv kernels for very small
+        // inputs, so a stub window is where windowed output stops being bit-reproducible
+        // against the whole-utterance decode on the GPU stream.
+        //
+        // The utterance is split into `ceil(total / step)` NEAR-EQUAL chunks rather than full
+        // `step` chunks plus whatever is left. The earlier rule absorbed a short remainder into
+        // the last chunk, which made that window up to `context + step + minTail − 1` frames.
+        // That broke the bound this function promises, and the activation envelope with it:
+        // +4031 MiB at 268 frames against a flat +3479 MiB, past the declared 4005 MiB (E28 V3,
+        // AB-L-0323). Equal chunks are never larger than `step`, and from 3 × step frames up
+        // they never fall below 3/4 of it either, so at the default 64 every chunk is at or
+        // above the 48-frame exactness floor and the decode is bit-identical to the whole one.
+        // A single window is kept for utterances up to `step + minTail` frames, as before.
         let minTail = max(8, step / 4)
+        let chunkCount = total <= step + minTail ? 1 : (total + step - 1) / step
         var start = 0
-        while start < total {
-            var end = min(start + step, total)
-            if total - end < minTail { end = total }
+        for index in 1 ... chunkCount {
+            let end = total * index / chunkCount
             let windowStart = max(0, start - context)
             let window = latent[0..., windowStart ..< end]
             let decoded = decodeFromLatent(window)
@@ -447,7 +456,7 @@ public final class ArkttsCodec: @unchecked Sendable {
             let drop = (start - windowStart) * Self.frameLength
             let samples = decoded[0..., drop...]
             eval(samples)
-            try onChunk(samples, end >= total)
+            try onChunk(samples, index == chunkCount)
             start = end
         }
     }

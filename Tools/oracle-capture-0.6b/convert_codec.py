@@ -19,7 +19,9 @@ HARNESS = DATA / "oracle-capture"
 import torch
 from safetensors.torch import save_file
 
-REPO = WORK / "reference" / "Audio8-TTS-Preview-0.6b"
+# AUDIO8_06B_CHECKPOINT picks the 0.6b checkpoint: Preview (default) or Realistic — same graph, new LM values.
+CHECKPOINT = os.environ.get("AUDIO8_06B_CHECKPOINT", "Audio8-TTS-Preview-0.6b")
+REPO = WORK / "reference" / CHECKPOINT
 OUT = HARNESS / "converted"
 OUT.mkdir(exist_ok=True)
 

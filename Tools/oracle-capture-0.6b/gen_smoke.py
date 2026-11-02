@@ -22,7 +22,9 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(WORK / "mlx-audio"))
 from mlx_audio.tts.models.arktts import Model, ModelConfig  # noqa: E402
 
-REPO = WORK / "reference" / "Audio8-TTS-Preview-0.6b"
+# AUDIO8_06B_CHECKPOINT picks the 0.6b checkpoint: Preview (default) or Realistic — same graph, new LM values.
+CHECKPOINT = os.environ.get("AUDIO8_06B_CHECKPOINT", "Audio8-TTS-Preview-0.6b")
+REPO = WORK / "reference" / CHECKPOINT
 REF_WAV = Path(
     "/Volumes/Satechi/Development/mlxengine-audio/PROD/gepard/oracle-capture/extra_ref_audio/roxy_d1_trim.wav"
 )
