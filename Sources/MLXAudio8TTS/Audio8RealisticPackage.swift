@@ -101,8 +101,13 @@ extension Audio8RealisticConfiguration: Audio8WeightResolving {
 
 // MARK: - Package
 
-/// Audio8-TTS-Realistic-0.6b on the canonical `tts` surface — **the recommended 0.6b
+/// Audio8-TTS-Realistic-Air on the canonical `tts` surface — **the recommended 0.6b
 /// checkpoint**, a weights-only successor to `Audio8Package`'s Preview-0.6b.
+///
+/// Upstream renamed the repo from `Edge0/Audio8-TTS-Realistic-0.6b` to
+/// `Edge0/Audio8-TTS-Realistic-Air` on 2026-11-02. The weights did not change: the pinned
+/// revision resolves under the new name, and the commits after it only edit the model card
+/// (AB-R-0719). "Air" is a release name, not a smaller model.
 ///
 /// Upstream (Edge0) trained it on top of the Preview with SFT, then GRPO against WER and
 /// speaker-similarity rewards, then GRPO against a realism critic. Code, codec, tokenizer,
@@ -151,7 +156,7 @@ public final class Audio8RealisticPackage: ModelPackage, StreamEmitting {
             // C8: the port code (this repo) is Apache-2.0.
             license: LicenseDeclaration(weightLicense: .apache2, portCodeLicense: .apache2),
             provenance: Provenance(
-                sourceRepo: "Edge0/Audio8-TTS-Realistic-0.6b",
+                sourceRepo: "Edge0/Audio8-TTS-Realistic-Air",
                 revision: "925bbd4c2d8360af85f2594bf0205173fda853ba", tier: 2),
             requirements: RequirementsManifest(
                 footprints: [

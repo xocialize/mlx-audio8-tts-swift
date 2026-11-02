@@ -67,7 +67,7 @@ final class RealisticManifestConformanceTests: XCTestCase {
     /// a copy-paste from the Preview's manifest would be wrong and still compile.
     func testProvenancePinsUpstreamRevision() {
         let provenance = Audio8RealisticPackage.manifest.provenance
-        XCTAssertEqual(provenance.sourceRepo, "Edge0/Audio8-TTS-Realistic-0.6b")
+        XCTAssertEqual(provenance.sourceRepo, "Edge0/Audio8-TTS-Realistic-Air")
         XCTAssertEqual(provenance.revision, "925bbd4c2d8360af85f2594bf0205173fda853ba")
     }
 

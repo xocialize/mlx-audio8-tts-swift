@@ -14,7 +14,7 @@ so they differ only in their manifests and default weights.
 
 | Package | Checkpoint | Weights | Choose it for |
 |---|---|---|---|
-| **`Audio8RealisticPackage`** | [Edge0/Audio8-TTS-Realistic-0.6b](https://huggingface.co/Edge0/Audio8-TTS-Realistic-0.6b) | `mlx-community/Audio8-TTS-Realistic-0.6b-bf16` | **the default.** 17 languages, plus Hindi, Norwegian and Swedish as experimental |
+| **`Audio8RealisticPackage`** | [Edge0/Audio8-TTS-Realistic-Air](https://huggingface.co/Edge0/Audio8-TTS-Realistic-Air) (formerly Realistic-0.6b) | `mlx-community/Audio8-TTS-Realistic-0.6b-bf16` | **the default.** 17 languages, plus Hindi, Norwegian and Swedish as experimental |
 | `Audio8Package` | [Audio8/Audio8-TTS-Preview-0.6b](https://huggingface.co/Audio8/Audio8-TTS-Preview-0.6b) | `mlx-community/Audio8-TTS-Preview-0.6b-bf16` | speech that must fit a tight time slot (fewer pauses) |
 | `Audio8MiniPackage` | [Audio8/Audio8-TTS-Preview-0.1b](https://huggingface.co/Audio8/Audio8-TTS-Preview-0.1b) | `mlx-community/Audio8-TTS-Preview-0.1b-bf16` | footprint: ~800 MB lighter resident. Lower similarity, 8 languages, revenue-capped licence |
 
