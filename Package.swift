@@ -47,7 +47,7 @@ let package = Package(
         // 3.32.3 is the first release with ml-explore/mlx-swift-lm#596, which exposes the
         // encoder surface this package needs (arktts feeds the slow stack a COMPOSITE
         // embedding, so it can never go through the token-id entry point).
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm", "3.32.3" ..< "3.33.0"),
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm", "3.32.3" ..< "3.34.0"),
     ],
     targets: [
         .target(
